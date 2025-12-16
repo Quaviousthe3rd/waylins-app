@@ -1,5 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { PaystackButton } from 'react-paystack';
 import { Link } from 'react-router-dom';
+import { v4 as uuidv4 } from 'uuid';
 import { User, Calendar, Scissors, CreditCard, CheckCircle, Clock, ArrowLeft, LogOut, ChevronRight, ChevronLeft, MapPin, Check, AlertCircle, RotateCcw } from 'lucide-react';
 import { api } from '../services/api';
 import { Client, ServiceItem, Booking, PaymentMethod, PaymentStatus, BookingStatus, Blockout } from '../types';
@@ -132,6 +134,7 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
   const [finalBooking, setFinalBooking] = useState<Booking | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(globalError || null);
+  const [isProcessingPayment, setIsProcessingPayment] = useState(false);
   
   const dateScrollRef = useRef<HTMLDivElement>(null);
   const [apiTick, setApiTick] = useState(0);
@@ -214,17 +217,28 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
     }
   }, [selectedDate, selectedService, rescheduleBooking, apiTick]);
 
-  const handleBook = async () => {
+  // Default to online payment when entering payment step
+  useEffect(() => {
+    if (!paymentMethod) {
+      setPaymentMethod(PaymentMethod.ONLINE);
+    }
+    if (!depositOption) {
+      setDepositOption('full');
+    }
+  }, [paymentMethod, depositOption]);
+
+  // Handle online payment - create booking after successful payment
+  const handlePaymentSuccess = async (response: any) => {
     if (!selectedService || !selectedDate || !selectedSlot || !paymentMethod || !depositOption) return;
     
-    setIsLoading(true);
+    setIsProcessingPayment(true);
     setError(null);
     
     try {
       const total = selectedService.price;
       const deposit = depositOption === 'deposit' ? total / 2 : total;
       
-      // Async creation
+      // Create booking with payment details after successful payment
       const booking = await api.createBooking({
         clientName: client.name,
         clientPhone: client.phone,
@@ -236,7 +250,9 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
         amount: total,
         depositAmount: deposit,
         paymentMethod: paymentMethod,
-        paymentStatus: paymentMethod === PaymentMethod.ONLINE ? PaymentStatus.PENDING : PaymentStatus.NOT_PAID
+        paymentStatus: PaymentStatus.PAID,
+        paymentReference: response.reference,
+        transactionId: response.transaction || response.trxref
       }, rescheduleBooking?.id);
 
       // Async Cancel old booking if rescheduling
@@ -253,15 +269,44 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
     } catch (e: any) {
       api.refresh(); 
       
+      // Payment succeeded but booking creation failed - critical error
       if (e.message && e.message.includes('Database not connected')) {
-          setError("System configuration missing. Please tell the owner to add API Keys.");
+          setError(`Payment successful (Ref: ${response.reference}) but booking failed. Please contact support with this reference.`);
       } else {
           console.error(e);
-          setError("Failed to book. Please check your internet connection.");
+          setError(`Payment successful (Ref: ${response.reference}) but booking failed. Please contact support.`);
       }
     } finally {
-      setIsLoading(false);
+      setIsProcessingPayment(false);
     }
+  };
+
+  const handlePaymentClose = () => {
+    setError("Payment was cancelled. Please try again or select 'Pay at Shop'.");
+    setIsProcessingPayment(false);
+  };
+
+  const handlePaymentError = (error: any) => {
+    console.error("Payment error:", error);
+    setError("Payment failed. Please try again or select 'Pay at Shop'.");
+    setIsProcessingPayment(false);
+  };
+
+  // Paystack requires an email; synthesize from phone digits (no user email input).
+  const phoneDigits = client.phone.replace(/\D/g, '') || '0000000000';
+  const paystackEmail = `${phoneDigits}@example.com`; // still phone-based, satisfies email format
+  const paystackSplitCode = import.meta.env.VITE_PAYSTACK_SPLIT_CODE;
+
+  // Main handleBook - routes to cash or online payment flow
+  const handleBook = () => {
+    if (!selectedService || !selectedDate || !selectedSlot || !paymentMethod || !depositOption) return;
+    
+    // For cash payments, create booking immediately
+    if (paymentMethod === PaymentMethod.CASH) {
+      handleCashBooking();
+    }
+    // For online payments, PaystackButton will trigger payment, then handlePaymentSuccess will create booking
+    // So we don't do anything here - the PaystackButton handles it
   };
 
   // Success Screen
@@ -499,17 +544,32 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
                     </div>
                  </Card>
 
-                 {/* Removed Deposit Options for Cash Only Mode */}
-                 {/* Auto-set deposit to full so logic still works */}
-                 <div className="hidden">
-                    {/* Hidden inputs to keep state consistent without UI clutter */}
-                    <button ref={r => { if(r && !depositOption) setDepositOption('full'); }} />
+                 {/* Deposit Options */}
+                 <div className="space-y-3">
+                    <label className="block text-[13px] font-semibold text-[#8E8E93] uppercase tracking-wide px-2">Payment Amount</label>
+                    <div className="grid grid-cols-2 gap-3">
+                        <button
+                            onClick={() => setDepositOption('deposit')}
+                            className={`p-4 rounded-2xl border transition-all text-left ${depositOption === 'deposit' ? 'border-[#007AFF] ring-1 ring-[#007AFF] bg-white shadow-sm' : 'border-transparent bg-white shadow-sm hover:bg-[#F2F2F7]'}`}
+                        >
+                            <div className="text-[13px] font-bold text-[#8E8E93] uppercase tracking-wide mb-1">Pay Deposit</div>
+                            <div className="text-xl font-bold text-[#1C1C1E]">50% (R{(selectedService.price / 2).toFixed(2)})</div>
+                            <div className="text-[12px] text-[#8E8E93] mt-1">Secure your booking now</div>
+                        </button>
+                        <button
+                            onClick={() => setDepositOption('full')}
+                            className={`p-4 rounded-2xl border transition-all text-left ${depositOption === 'full' ? 'border-[#007AFF] ring-1 ring-[#007AFF] bg-white shadow-sm' : 'border-transparent bg-white shadow-sm hover:bg-[#F2F2F7]'}`}
+                        >
+                            <div className="text-[13px] font-bold text-[#8E8E93] uppercase tracking-wide mb-1">Pay Full</div>
+                            <div className="text-xl font-bold text-[#1C1C1E]">R{selectedService.price.toFixed(2)}</div>
+                            <div className="text-[12px] text-[#8E8E93] mt-1">No balance on arrival</div>
+                        </button>
+                    </div>
                  </div>
 
                  <div className="space-y-3">
                     <label className="block text-[13px] font-semibold text-[#8E8E93] uppercase tracking-wide px-2">Payment Method</label>
                     <div className="space-y-3">
-                        {/* ONLINE PAYMENT HIDDEN FOR LAUNCH
                         <button
                             onClick={() => setPaymentMethod(PaymentMethod.ONLINE)}
                             className={`w-full p-4 rounded-2xl flex items-center justify-between transition-all bg-white shadow-sm border ${paymentMethod === PaymentMethod.ONLINE ? 'border-[#007AFF] ring-1 ring-[#007AFF]' : 'border-transparent'}`}
@@ -525,28 +585,55 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
                             </div>
                             {paymentMethod === PaymentMethod.ONLINE && <Check size={20} className="text-[#007AFF]" />}
                         </button>
-                        */}
-
-                        <button
-                            onClick={() => setPaymentMethod(PaymentMethod.CASH)}
-                            className={`w-full p-4 rounded-2xl flex items-center justify-between transition-all bg-white shadow-sm border ${paymentMethod === PaymentMethod.CASH ? 'border-[#007AFF] ring-1 ring-[#007AFF]' : 'border-transparent'}`}
-                        >
-                            <div className="flex items-center gap-4">
-                                <div className="w-10 h-10 rounded-full bg-[#34C759]/10 flex items-center justify-center text-[#34C759]">
-                                    <div className="font-bold text-lg">R</div>
-                                </div>
-                                <div className="text-left">
-                                    <div className="font-semibold text-[#1C1C1E]">Pay at Shop</div>
-                                    <div className="text-[13px] text-[#8E8E93]">Cash or Card on arrival</div>
-                                </div>
-                            </div>
-                            {/* Always show checkmark since it's the only option */}
-                            <Check size={20} className="text-[#007AFF]" />
-                            {/* Auto-select on mount logic for single option */}
-                            <div ref={r => { if(r && !paymentMethod) setPaymentMethod(PaymentMethod.CASH); }} />
-                        </button>
                     </div>
                  </div>
+
+                 {/* Paystack Payment Button - Only show when online payment is selected */}
+                 {paymentMethod === PaymentMethod.ONLINE && selectedService && selectedDate && selectedSlot && depositOption && (
+                    <div className="mt-6">
+                        {!import.meta.env.VITE_PAYSTACK_PUBLIC_KEY ? (
+                            <div className="p-4 bg-[#FF9500]/10 text-[#FF9500] rounded-2xl flex items-center gap-3 text-sm font-medium">
+                                <AlertCircle size={20} />
+                                Payment system not configured. Please contact support or select 'Pay at Shop'.
+                            </div>
+                        ) : (
+                            <div className="space-y-3">
+                                {paymentMethod === PaymentMethod.ONLINE && !paystackSplitCode && (
+                                    <div className="p-3 bg-[#FF9500]/10 text-[#FF9500] rounded-xl text-sm font-medium">
+                                        Warning: No Paystack split code set. Add VITE_PAYSTACK_SPLIT_CODE to enable revenue split.
+                                    </div>
+                                )}
+                                <div className="[&>button]:w-full [&>button]:h-14 [&>button]:bg-[#007AFF] [&>button]:text-white [&>button]:rounded-full [&>button]:font-semibold [&>button]:text-lg [&>button]:shadow-xl [&>button]:hover:bg-[#0066CC] [&>button]:transition-all [&>button]:disabled:opacity-50 [&>button]:disabled:cursor-not-allowed">
+                                    <PaystackButton
+                                        publicKey={import.meta.env.VITE_PAYSTACK_PUBLIC_KEY}
+                                        email={paystackEmail} // synthesized from phone to satisfy email format
+                                        amount={Math.round((depositOption === 'deposit' ? selectedService.price * 0.5 : selectedService.price) * 100)} // cents
+                                        currency="ZAR"
+                                        reference={`WAYLANS-${Date.now()}-${uuidv4().substring(0, 8)}`}
+                                        metadata={{ phone: phoneDigits }}
+                                        split_code={paystackSplitCode || undefined}
+                                        text={
+                                          isProcessingPayment
+                                            ? "Processing..."
+                                            : rescheduleBooking
+                                              ? `Pay & Reschedule (R${depositOption === 'deposit' ? selectedService.price / 2 : selectedService.price})`
+                                              : `Pay Now (R${depositOption === 'deposit' ? selectedService.price / 2 : selectedService.price})`
+                                        }
+                                        onSuccess={handlePaymentSuccess}
+                                        onClose={handlePaymentClose}
+                                        onError={handlePaymentError}
+                                        disabled={isProcessingPayment}
+                                    />
+                                </div>
+                                {isProcessingPayment && (
+                                    <div className="text-center text-sm text-[#8E8E93] font-medium">
+                                        Processing payment...
+                                    </div>
+                                )}
+                            </div>
+                        )}
+                    </div>
+                 )}
             </div>
            )}
        </div>
@@ -557,24 +644,34 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
          <div className="h-12 bg-gradient-to-t from-[#F2F2F7] to-transparent pointer-events-none" />
          <div className="bg-[#F2F2F7]/80 backdrop-blur-xl border-t border-[#000000]/10 p-4 pb-8">
              <div className="max-w-lg mx-auto">
-                <Button 
-                    fullWidth 
-                    variant={step === 3 ? 'secondary' : 'primary'}
-                    disabled={
-                        (step === 1 && !selectedService) || 
-                        (step === 2 && (!selectedDate || !selectedSlot)) ||
-                        (step === 3 && (!paymentMethod || !depositOption)) ||
-                        isLoading
-                    }
-                    onClick={() => {
-                        if(step === 1) setStep(2);
-                        else if(step === 2) setStep(3);
-                        else if(step === 3) handleBook();
-                    }}
-                    className="shadow-xl"
-                >
-                    {isLoading ? 'Processing...' : (step === 3 ? (rescheduleBooking ? 'Confirm & Reschedule' : 'Confirm Booking') : 'Continue')}
-                </Button>
+                {/* For Step 3 with online payment, PaystackButton is shown above, so hide this button */}
+                {!(step === 3 && paymentMethod === PaymentMethod.ONLINE) && (
+                    <Button 
+                        fullWidth 
+                        variant={step === 3 ? 'secondary' : 'primary'}
+                        disabled={
+                            (step === 1 && !selectedService) || 
+                            (step === 2 && (!selectedDate || !selectedSlot)) ||
+                            (step === 3 && (!paymentMethod || !depositOption)) ||
+                            isLoading ||
+                            isProcessingPayment
+                        }
+                        onClick={() => {
+                            if(step === 1) setStep(2);
+                            else if(step === 2) setStep(3);
+                            else if(step === 3) handleBook();
+                        }}
+                        className="shadow-xl"
+                    >
+                        {isLoading ? 'Processing...' : (step === 3 ? (rescheduleBooking ? 'Confirm & Reschedule' : 'Confirm Booking') : 'Continue')}
+                    </Button>
+                )}
+                {/* Show message when processing online payment */}
+                {step === 3 && paymentMethod === PaymentMethod.ONLINE && isProcessingPayment && (
+                    <div className="text-center text-sm text-[#8E8E93] font-medium py-2">
+                        Processing payment...
+                    </div>
+                )}
              </div>
          </div>
        </div>

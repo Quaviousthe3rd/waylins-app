@@ -26,12 +26,12 @@ import {
 
 // --- CONFIGURATION ---
 const firebaseConfig = {
-  apiKey: "AIzaSyDok2PkDt8jzgU5sd8y1s1K8c7Yn5sxH4M",
-  authDomain: "waylans-barbershop-app.firebaseapp.com",
-  projectId: "waylans-barbershop-app",
-  storageBucket: "waylans-barbershop-app.firebasestorage.app",
-  messagingSenderId: "272816108990",
-  appId: "1:272816108990:web:b40828bbe71fa2589fb5ef"
+  apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
+  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
+  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID,
+  storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET,
+  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID,
+  appId: import.meta.env.VITE_FIREBASE_APP_ID
 };
 
 // Initialize Firebase

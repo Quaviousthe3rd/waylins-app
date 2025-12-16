@@ -43,6 +43,8 @@ export interface Booking {
   paymentStatus: PaymentStatus;
   status: BookingStatus;
   createdAt: string;
+  paymentReference?: string; // Paystack transaction reference
+  transactionId?: string; // Paystack transaction ID
 }
 
 export interface WorkingHours {
