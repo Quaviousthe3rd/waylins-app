@@ -297,6 +297,57 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
   const paystackEmail = `${phoneDigits}@example.com`; // still phone-based, satisfies email format
   const paystackSplitCode = import.meta.env.VITE_PAYSTACK_SPLIT_CODE;
 
+  // Handle cash (pay at shop) bookings - creates booking without online payment
+  const handleCashBooking = async () => {
+    if (!selectedService || !selectedDate || !selectedSlot) return;
+
+    setIsLoading(true);
+    setError(null);
+
+    try {
+      const total = selectedService.price;
+      // For cash payments, we treat everything as payable at the shop
+      const deposit = 0;
+
+      const booking = await api.createBooking({
+        clientName: client.name,
+        clientPhone: client.phone,
+        date: selectedDate,
+        timeSlot: selectedSlot,
+        serviceId: selectedService.id,
+        serviceName: selectedService.name,
+        durationMinutes: selectedService.durationMinutes,
+        amount: total,
+        depositAmount: deposit,
+        paymentMethod: PaymentMethod.CASH,
+        paymentStatus: PaymentStatus.NOT_PAID,
+        paymentReference: undefined,
+        transactionId: undefined
+      }, rescheduleBooking?.id);
+
+      if (rescheduleBooking) {
+        try {
+          await api.updateBooking(rescheduleBooking.id, { status: BookingStatus.CANCELLED });
+        } catch (e) {
+          console.warn("Could not auto-cancel old booking during reschedule (cash flow)", e);
+        }
+      }
+
+      setFinalBooking(booking);
+      setStep(5);
+    } catch (e: any) {
+      console.error(e);
+      if (e.message && e.message.includes('Database not connected')) {
+        setError('Unable to create booking at the moment. Please try again later or contact the shop.');
+      } else {
+        setError('Something went wrong while creating your booking. Please try again.');
+      }
+      api.refresh();
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
   // Main handleBook - routes to cash or online payment flow
   const handleBook = () => {
     if (!selectedService || !selectedDate || !selectedSlot || !paymentMethod || !depositOption) return;
@@ -610,7 +661,7 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
                                         amount={Math.round((depositOption === 'deposit' ? selectedService.price * 0.5 : selectedService.price) * 100)} // cents
                                         currency="ZAR"
                                         reference={`WAYLANS-${Date.now()}-${uuidv4().substring(0, 8)}`}
-                                        metadata={{ phone: phoneDigits }}
+                                        metadata={{ phone: phoneDigits } as any}
                                         split_code={paystackSplitCode || undefined}
                                         text={
                                           isProcessingPayment
@@ -621,7 +672,6 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
                                         }
                                         onSuccess={handlePaymentSuccess}
                                         onClose={handlePaymentClose}
-                                        onError={handlePaymentError}
                                         disabled={isProcessingPayment}
                                     />
                                 </div>
