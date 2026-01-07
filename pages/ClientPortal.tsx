@@ -8,6 +8,8 @@ import { Client, ServiceItem, Booking, PaymentMethod, PaymentStatus, BookingStat
 import { format, addDays, startOfToday, getDay } from 'date-fns';
 import { Button } from '../components/ui/Button';
 import { Card } from '../components/ui/Card';
+import { notify } from '../services/notifications';
+import { Footer } from '../components/Footer';
 
 // --- Sub-Components for Wizard Steps ---
 
@@ -37,7 +39,7 @@ const LoginStep: React.FC<{ onComplete: (client: Client) => void }> = ({ onCompl
       }
 
       const client = { name: name.trim(), phone: cleanPhone };
-      localStorage.setItem('waylans_client', JSON.stringify(client));
+      localStorage.setItem('waylins_client', JSON.stringify(client));
       onComplete(client);
     }
   };
@@ -49,7 +51,7 @@ const LoginStep: React.FC<{ onComplete: (client: Client) => void }> = ({ onCompl
           <div className="w-24 h-24 bg-[#1C1C1E] rounded-[2.5rem] flex items-center justify-center mx-auto mb-8 shadow-2xl shadow-black/10">
             <Scissors className="text-white w-10 h-10" strokeWidth={1.5} />
           </div>
-          <h1 className="text-3xl font-bold text-[#1C1C1E] mb-2 tracking-tight">Waylan's</h1>
+          <h1 className="text-3xl font-bold text-[#1C1C1E] mb-2 tracking-tight">Waylin's</h1>
           <p className="text-[#8E8E93] font-medium">Premium Grooming</p>
         </div>
         
@@ -101,6 +103,7 @@ const LoginStep: React.FC<{ onComplete: (client: Client) => void }> = ({ onCompl
           </Link>
         </div>
       </div>
+      <Footer />
     </div>
   );
 };
@@ -238,6 +241,11 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
       const total = selectedService.price;
       const deposit = depositOption === 'deposit' ? total / 2 : total;
       
+      // Determine payment status based on deposit amount
+      const paymentStatus = depositOption === 'deposit' 
+        ? PaymentStatus.PARTIALLY_PAID
+        : PaymentStatus.PAID;
+      
       // Create booking with payment details after successful payment
       const booking = await api.createBooking({
         clientName: client.name,
@@ -250,7 +258,7 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
         amount: total,
         depositAmount: deposit,
         paymentMethod: paymentMethod,
-        paymentStatus: PaymentStatus.PAID,
+        paymentStatus: paymentStatus,
         paymentReference: response.reference,
         transactionId: response.transaction || response.trxref
       }, rescheduleBooking?.id);
@@ -266,30 +274,38 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
       
       setFinalBooking(booking);
       setStep(5);
+      const paymentMessage = depositOption === 'deposit' 
+        ? 'Booking confirmed! 50% deposit paid successfully.'
+        : 'Booking confirmed! Full payment successful.';
+      notify.success(paymentMessage);
     } catch (e: any) {
       api.refresh(); 
       
       // Payment succeeded but booking creation failed - critical error
-      if (e.message && e.message.includes('Database not connected')) {
-          setError(`Payment successful (Ref: ${response.reference}) but booking failed. Please contact support with this reference.`);
-      } else {
-          console.error(e);
-          setError(`Payment successful (Ref: ${response.reference}) but booking failed. Please contact support.`);
-      }
+      const errorMessage = e.message && e.message.includes('Database not connected')
+        ? `Payment successful (Ref: ${response.reference}) but booking failed. Please contact support with this reference.`
+        : `Payment successful (Ref: ${response.reference}) but booking failed. Please contact support.`;
+      
+      setError(errorMessage);
+      notify.error(errorMessage);
     } finally {
       setIsProcessingPayment(false);
     }
   };
 
   const handlePaymentClose = () => {
-    setError("Payment was cancelled. Please try again or select 'Pay at Shop'.");
+    const message = "Payment was cancelled. Please try again or select 'Pay at Shop'.";
+    setError(message);
     setIsProcessingPayment(false);
+    notify.warning(message);
   };
 
   const handlePaymentError = (error: any) => {
     console.error("Payment error:", error);
-    setError("Payment failed. Please try again or select 'Pay at Shop'.");
+    const message = "Payment failed. Please try again or select 'Pay at Shop'.";
+    setError(message);
     setIsProcessingPayment(false);
+    notify.error(message);
   };
 
   // Paystack requires an email; synthesize from phone digits (no user email input).
@@ -335,13 +351,20 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
 
       setFinalBooking(booking);
       setStep(5);
+      const message = rescheduleBooking 
+        ? 'Booking rescheduled successfully! Please pay at the shop.'
+        : 'Booking confirmed! Please pay at the shop.';
+      notify.success(message);
     } catch (e: any) {
       console.error(e);
+      let errorMessage: string;
       if (e.message && e.message.includes('Database not connected')) {
-        setError('Unable to create booking at the moment. Please try again later or contact the shop.');
+        errorMessage = 'Unable to create booking at the moment. Please try again later or contact the shop.';
       } else {
-        setError('Something went wrong while creating your booking. Please try again.');
+        errorMessage = 'Something went wrong while creating your booking. Please try again.';
       }
+      setError(errorMessage);
+      notify.error(errorMessage);
       api.refresh();
     } finally {
       setIsLoading(false);
@@ -390,7 +413,7 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
               <div className="flex justify-between items-end pt-4">
                 <div>
                   <div className="text-[11px] font-bold text-[#8E8E93] uppercase tracking-widest mb-1">Status</div>
-                  <span className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-bold uppercase tracking-wide ${finalBooking.paymentStatus === PaymentStatus.NOT_PAID ? 'bg-[#FF9500]/10 text-[#FF9500]' : 'bg-[#34C759]/10 text-[#34C759]'}`}>
+                  <span className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-bold uppercase tracking-wide ${finalBooking.paymentStatus === PaymentStatus.NOT_PAID || finalBooking.paymentStatus === PaymentStatus.PARTIALLY_PAID ? 'bg-[#FF9500]/10 text-[#FF9500]' : 'bg-[#34C759]/10 text-[#34C759]'}`}>
                     {finalBooking.paymentStatus}
                   </span>
                 </div>
@@ -660,7 +683,7 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
                                         email={paystackEmail} // synthesized from phone to satisfy email format
                                         amount={Math.round((depositOption === 'deposit' ? selectedService.price * 0.5 : selectedService.price) * 100)} // cents
                                         currency="ZAR"
-                                        reference={`WAYLANS-${Date.now()}-${uuidv4().substring(0, 8)}`}
+                                        reference={`WAYLINS-${Date.now()}-${uuidv4().substring(0, 8)}`}
                                         metadata={{ phone: phoneDigits } as any}
                                         split_code={paystackSplitCode || undefined}
                                         text={
@@ -745,8 +768,10 @@ const MyBookings: React.FC<{ client: Client, onBack: () => void, onReschedule: (
         if(confirm('Cancel this appointment?')) {
             try {
                 await api.updateBooking(id, { status: BookingStatus.CANCELLED });
+                notify.success('Appointment cancelled successfully');
             } catch (e) {
                 console.warn(e);
+                notify.error('Failed to cancel appointment. Please try again.');
                 setRefresh(r => r + 1); 
             }
         }
@@ -791,7 +816,7 @@ const MyBookings: React.FC<{ client: Client, onBack: () => void, onReschedule: (
                                         <div className="flex items-center gap-2 text-sm font-medium text-[#8E8E93]">
                                             <span className="text-[#1C1C1E]">R{b.amount}</span>
                                             <span>•</span>
-                                            <span className={b.paymentStatus === PaymentStatus.NOT_PAID ? 'text-[#FF9500]' : 'text-[#34C759]'}>{b.paymentStatus}</span>
+                                            <span className={b.paymentStatus === PaymentStatus.NOT_PAID || b.paymentStatus === PaymentStatus.PARTIALLY_PAID ? 'text-[#FF9500]' : 'text-[#34C759]'}>{b.paymentStatus}</span>
                                         </div>
                                         {b.status !== BookingStatus.CANCELLED && (
                                             <div className="flex gap-2">
@@ -822,14 +847,14 @@ export const ClientPortal: React.FC = () => {
   const [globalError, setGlobalError] = useState<string | null>(null);
 
   useEffect(() => {
-      const stored = localStorage.getItem('waylans_client');
+      const stored = localStorage.getItem('waylins_client');
       if (stored) {
           setClient(JSON.parse(stored));
       }
   }, []);
 
   const handleLogout = () => {
-      localStorage.removeItem('waylans_client');
+      localStorage.removeItem('waylins_client');
       setClient(null);
       setView('wizard');
       setPreselectedService(null);

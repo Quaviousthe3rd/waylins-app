@@ -7,6 +7,7 @@ export enum PaymentStatus {
   PAID = 'Paid',
   PENDING = 'Pending',
   NOT_PAID = 'Not Paid',
+  PARTIALLY_PAID = 'Partially Paid',
   REFUNDED = 'Refunded'
 }
 

@@ -7,6 +7,7 @@ import { Card } from '../components/ui/Card';
 import { Calendar, List, Settings, Scissors, Clock, LogOut, Plus, Trash, Ban, Search, ChevronRight, CreditCard, RefreshCw, X, Edit2, Phone, Menu, Loader2 } from 'lucide-react';
 import { format, isBefore, parseISO } from 'date-fns';
 import { DEFAULT_HOURS, STORAGE_KEYS } from '../constants';
+import { notify } from '../services/notifications';
 
 // --- Admin Login ---
 const AdminLogin: React.FC<{ onLogin: () => void }> = ({ onLogin }) => {
@@ -133,18 +134,20 @@ const BookingsTab: React.FC = () => {
   const updateStatus = async (booking: Booking, status: BookingStatus) => {
     try {
         await api.updateBooking(booking.id, { status });
+        notify.success(`Booking ${status.toLowerCase()} successfully`);
     } catch (e) {
         console.error('Update failed', e);
-        alert('Failed to update booking. It may have been deleted.');
+        notify.error('Failed to update booking. It may have been deleted.');
     }
   };
   
   const updatePayment = async (booking: Booking, status: PaymentStatus) => {
     try {
         await api.updateBooking(booking.id, { paymentStatus: status });
+        notify.success(`Payment status updated to ${status}`);
     } catch (e) {
         console.error('Update failed', e);
-        alert('Failed to update payment status.');
+        notify.error('Failed to update payment status.');
     }
   };
 
@@ -234,12 +237,33 @@ const BookingsTab: React.FC = () => {
                       </td>
                       <td className="p-4 whitespace-nowrap">
                           <div className="flex flex-col gap-1 items-start">
-                              <span className="font-semibold text-[#1C1C1E] text-sm">R{b.amount}</span>
+                              <div className="flex flex-col gap-0.5">
+                                  <span className="font-semibold text-[#1C1C1E] text-sm">R{b.amount}</span>
+                                  {b.paymentStatus === PaymentStatus.PARTIALLY_PAID && (
+                                      <div className="text-[10px] text-[#8E8E93]">
+                                          Paid: R{b.depositAmount.toFixed(2)} | 
+                                          <span className="text-[#FF9500] font-semibold"> Balance: R{(b.amount - b.depositAmount).toFixed(2)}</span>
+                                      </div>
+                                  )}
+                              </div>
                               <button 
-                                  onClick={() => updatePayment(b, b.paymentStatus === PaymentStatus.PAID ? PaymentStatus.NOT_PAID : PaymentStatus.PAID)}
+                                  onClick={() => {
+                                      // Toggle logic: PARTIALLY_PAID -> PAID, PAID -> NOT_PAID, NOT_PAID -> PAID
+                                      let newStatus: PaymentStatus;
+                                      if (b.paymentStatus === PaymentStatus.PARTIALLY_PAID) {
+                                          newStatus = PaymentStatus.PAID; // Mark as fully paid when balance collected
+                                      } else if (b.paymentStatus === PaymentStatus.PAID) {
+                                          newStatus = PaymentStatus.NOT_PAID;
+                                      } else {
+                                          newStatus = PaymentStatus.PAID;
+                                      }
+                                      updatePayment(b, newStatus);
+                                  }}
                                   className={`text-[10px] font-bold px-2 py-0.5 rounded-full border transition-all cursor-pointer
                                   ${b.paymentStatus === PaymentStatus.PAID 
                                       ? 'bg-[#34C759]/10 text-[#34C759] border-transparent hover:bg-[#34C759]/20' 
+                                      : b.paymentStatus === PaymentStatus.PARTIALLY_PAID
+                                      ? 'bg-[#FF9500]/10 text-[#FF9500] border-transparent hover:bg-[#FF9500]/20'
                                       : 'bg-[#FF9500]/10 text-[#FF9500] border-transparent hover:bg-[#FF9500] hover:text-white'}`}
                               >
                                   {b.paymentStatus}
@@ -337,8 +361,9 @@ const ServicesTab: React.FC = () => {
         setEditingId(null);
         setInitialData(null);
         setFormData({ name: '', price: '', duration: '60' });
+        notify.success('Service saved successfully');
     } catch (e) {
-        alert("Failed to save service. Storage might be full or item modified.");
+        notify.error("Failed to save service. Storage might be full or item modified.");
     }
   };
 
@@ -346,8 +371,9 @@ const ServicesTab: React.FC = () => {
     if (!confirm('Delete this service?')) return;
     try {
         await api.deleteService(id);
+        notify.success('Service deleted successfully');
     } catch (e) {
-        alert("Failed to delete service.");
+        notify.error("Failed to delete service.");
     }
   };
 
@@ -453,8 +479,9 @@ const SettingsTab: React.FC = () => {
         try {
             const hours = config.weeklyHours[dayIndex] || DEFAULT_HOURS[dayIndex];
             await api.updateWorkingHours(dayIndex, { isClosed: !hours.isClosed });
+            notify.success('Working hours updated');
         } catch (e) {
-            alert("Failed to update hours.");
+            notify.error("Failed to update hours.");
         }
     }
 
@@ -473,8 +500,9 @@ const SettingsTab: React.FC = () => {
             }
 
             await api.updateWorkingHours(dayIndex, { [field]: value });
+            notify.success('Working hours updated');
         } catch (e) {
-            alert("Failed to update hours.");
+            notify.error("Failed to update hours.");
         }
     };
 
@@ -492,16 +520,18 @@ const SettingsTab: React.FC = () => {
             
             setNewBlockout({ date: '', startTime: '09:00', endTime: '17:00', reason: 'Holiday' });
             setError(null);
+            notify.success('Blockout added successfully');
         } catch (e) {
-            alert("Failed to save blockout.");
+            notify.error("Failed to save blockout.");
         }
     };
 
     const removeBlockout = async (id: string) => {
         try {
             await api.removeBlockout(id);
+            notify.success('Blockout deleted successfully');
         } catch (e) {
-            alert("Failed to delete blockout.");
+            notify.error("Failed to delete blockout.");
         }
     };
 
@@ -649,7 +679,7 @@ export const AdminPortal: React.FC = () => {
                 <div className="w-8 h-8 bg-[#1C1C1E] rounded-lg flex items-center justify-center shadow-sm">
                     <Scissors className="text-white" size={16} />
                 </div>
-                <h1 className="font-bold text-base tracking-tight">Waylan's <span className="text-[#8E8E93] font-normal text-xs">Manager</span></h1>
+                <h1 className="font-bold text-base tracking-tight">Waylin's <span className="text-[#8E8E93] font-normal text-xs">Manager</span></h1>
           </div>
           <button onClick={() => setIsSidebarOpen(!isSidebarOpen)} className="p-2 text-[#1C1C1E]">
               {isSidebarOpen ? <X size={24} /> : <Menu size={24} />}
@@ -678,7 +708,7 @@ export const AdminPortal: React.FC = () => {
                 <div className="w-9 h-9 bg-[#1C1C1E] rounded-xl flex items-center justify-center shadow-sm">
                     <Scissors className="text-white" size={18} />
                 </div>
-                <h1 className="font-bold text-lg tracking-tight">Waylan's<span className="text-[#8E8E93] font-normal block text-xs">Manager</span></h1>
+                <h1 className="font-bold text-lg tracking-tight">Waylin's<span className="text-[#8E8E93] font-normal block text-xs">Manager</span></h1>
             </div>
 
             <nav className="space-y-1 mt-8 md:mt-0">

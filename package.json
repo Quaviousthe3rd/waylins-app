@@ -1,5 +1,5 @@
 {
-  "name": "waylans-barbershop",
+  "name": "waylins-barbershop",
   "private": true,
   "version": "1.0.0",
   "type": "module",
@@ -10,10 +10,11 @@
   },
   "dependencies": {
     "date-fns": "^3.3.1",
-    "firebase": "^10.8.0",
+    "firebase": "^10.14.1",
     "lucide-react": "^0.344.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
+    "react-hot-toast": "^2.6.0",
     "react-paystack": "^6.0.0",
     "react-router-dom": "^6.22.3",
     "uuid": "^9.0.1"
