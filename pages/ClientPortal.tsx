@@ -311,7 +311,28 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
   // Paystack requires an email; synthesize from phone digits (no user email input).
   const phoneDigits = client.phone.replace(/\D/g, '') || '0000000000';
   const paystackEmail = `${phoneDigits}@example.com`; // still phone-based, satisfies email format
-  const paystackSplitCode = import.meta.env.VITE_PAYSTACK_SPLIT_CODE;
+  
+  // Get and validate split code
+  const rawSplitCode = import.meta.env.VITE_PAYSTACK_SPLIT_CODE?.trim();
+  const paystackSplitCode = rawSplitCode && rawSplitCode.startsWith('SPL_') 
+    ? rawSplitCode 
+    : rawSplitCode || undefined;
+
+  // Debug logging for Paystack configuration (remove after verification)
+  useEffect(() => {
+    if (paymentMethod === PaymentMethod.ONLINE) {
+      console.log('=== Paystack Configuration Debug ===');
+      console.log('Public Key:', import.meta.env.VITE_PAYSTACK_PUBLIC_KEY ? `${import.meta.env.VITE_PAYSTACK_PUBLIC_KEY.substring(0, 20)}...` : 'MISSING');
+      console.log('Raw Split Code:', rawSplitCode || 'NOT SET');
+      console.log('Validated Split Code:', paystackSplitCode || 'NOT SET');
+      console.log('Split Code Length:', paystackSplitCode?.length || 0);
+      console.log('Split Code Type:', typeof paystackSplitCode);
+      if (rawSplitCode && !rawSplitCode.startsWith('SPL_')) {
+        console.warn('⚠️ WARNING: Split code does not start with "SPL_". Format should be: SPL_xxxxxxxxxx');
+      }
+      console.log('===================================');
+    }
+  }, [paymentMethod, paystackSplitCode, rawSplitCode]);
 
   // Handle cash (pay at shop) bookings - creates booking without online payment
   const handleCashBooking = async () => {
@@ -672,7 +693,13 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
                             </div>
                         ) : (
                             <div className="space-y-3">
-                                {paymentMethod === PaymentMethod.ONLINE && !paystackSplitCode && (
+                                {paymentMethod === PaymentMethod.ONLINE && rawSplitCode && !rawSplitCode.startsWith('SPL_') && (
+                                    <div className="p-3 bg-[#FF3B30]/10 text-[#FF3B30] rounded-xl text-sm font-medium">
+                                        <AlertCircle size={16} className="inline mr-2" />
+                                        Invalid split code format. Split code must start with "SPL_". Current value: "{rawSplitCode.substring(0, 20)}..."
+                                    </div>
+                                )}
+                                {paymentMethod === PaymentMethod.ONLINE && !paystackSplitCode && !rawSplitCode && (
                                     <div className="p-3 bg-[#FF9500]/10 text-[#FF9500] rounded-xl text-sm font-medium">
                                         Warning: No Paystack split code set. Add VITE_PAYSTACK_SPLIT_CODE to enable revenue split.
                                     </div>

@@ -51,3 +51,4 @@ export const Pricing: React.FC = () => {
   );
 };
 
+
