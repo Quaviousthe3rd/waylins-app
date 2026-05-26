@@ -14,18 +14,16 @@
 Make sure your `.env` file in the project root has the correct format:
 
 ```env
-VITE_FIREBASE_API_KEY=AIzaSyD_U_Ga9R4t4nyId2Gzcazk_hXVW9365HI
-VITE_FIREBASE_AUTH_DOMAIN=waylins-37532.firebaseapp.com
-VITE_FIREBASE_PROJECT_ID=waylins-37532
-VITE_FIREBASE_STORAGE_BUCKET=waylins-37532.firebasestorage.app
-VITE_FIREBASE_MESSAGING_SENDER_ID=8335294088
-VITE_FIREBASE_APP_ID=1:8335294088:web:42a08f408962e3e6c1693d
 VITE_PAYSTACK_PUBLIC_KEY=pk_live_abcfe1c68eb921cd12a14486b814536db3048b42
-VITE_PAYSTACK_SPLIT_CODE=SPL_tvidUCs3wN
+# Recommended: Use Subaccount to ensure exact 15% of the base fee is split to you
+VITE_PAYSTACK_SUBACCOUNT=ACCT_abc123def456
+# Legacy (Not recommended because it takes 15% of the TOTAL including service fee)
+# VITE_PAYSTACK_SPLIT_CODE=SPL_tvidUCs3wN
 ```
 
 **Critical Points:**
-- ✅ Split code must be exactly: `SPL_tvidUCs3wN` (no `split_` prefix)
+- ✅ Subaccount code must be exactly: `ACCT_abc123def456`
+- ✅ Split code (if still used) must be exactly: `SPL_tvidUCs3wN`
 - ✅ No spaces around the `=` sign
 - ✅ No quotes around values
 - ✅ No trailing spaces

@@ -63,6 +63,49 @@ const notifyListeners = () => {
   });
 };
 
+const escapeHTML = (str: string) => {
+    if (!str) return '';
+    return str.replace(/[&<>"']/g, (m) => {
+        switch (m) {
+            case '&': return '&amp;';
+            case '<': return '&lt;';
+            case '>': return '&gt;';
+            case '"': return '&quot;';
+            case "'": return '&#39;';
+            default: return m;
+        }
+    });
+};
+
+const sendTelegramNotification = async (message: string) => {
+    const token = import.meta.env.VITE_TELEGRAM_BOT_TOKEN;
+    const chatId = import.meta.env.VITE_TELEGRAM_CHAT_ID;
+    
+    if (!token || !chatId) {
+        console.warn("Telegram credentials missing. Notification not sent.");
+        return;
+    }
+    
+    try {
+        const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                chat_id: chatId,
+                text: message,
+                parse_mode: 'HTML'
+            })
+        });
+
+        if (!response.ok) {
+            const errorBody = await response.json();
+            console.error("Telegram API Error Details:", errorBody);
+        }
+    } catch (error) {
+        console.error("Failed to send Telegram notification:", error);
+    }
+};
+
 // --- API IMPLEMENTATION ---
 
 export const api = {
@@ -234,6 +277,19 @@ export const api = {
      if (db) {
          // Direct atomic write with specific ID
          await setDoc(doc(db, 'bookings', id), newBooking);
+         
+         // Send Telegram Notification
+         const message = `🚨 <b>New Booking!</b>\n\n` +
+             `👤 <b>Client:</b> ${escapeHTML(bookingData.clientName)}\n` +
+             `📱 <b>Phone:</b> ${escapeHTML(bookingData.clientPhone)}\n` +
+             `✂️ <b>Service:</b> ${escapeHTML(bookingData.serviceName)}\n` +
+             `📅 <b>Date:</b> ${escapeHTML(bookingData.date)}\n` +
+             `⏰ <b>Time:</b> ${escapeHTML(bookingData.timeSlot)}\n` +
+             `💰 <b>Total:</b> R${bookingData.amount}\n` +
+             `💳 <b>Payment:</b> ${escapeHTML(bookingData.paymentMethod)} (${escapeHTML(bookingData.paymentStatus)})`;
+         
+         sendTelegramNotification(message);
+
          return newBooking;
      } else {
          throw new Error("Database not connected. Please check internet or API Keys.");
@@ -244,6 +300,25 @@ export const api = {
      if (db) {
          const docRef = doc(db, 'bookings', id);
          await updateDoc(docRef, updates);
+         
+         // If status is updated (like CANCELLED) or payment updated, send a notification
+         if (updates.status || updates.paymentStatus) {
+             const booking = bookingsCache.find(b => b.id === id);
+             const clientName = booking?.clientName || 'Unknown Client';
+             
+             let message = `⚠️ <b>Booking Updated</b>\n\n`;
+             message += `👤 <b>Client:</b> ${escapeHTML(clientName)}\n`;
+             
+             if (updates.status) {
+                 message += `📌 <b>Status:</b> ${updates.status}\n`;
+             }
+             if (updates.paymentStatus) {
+                 message += `💰 <b>Payment:</b> ${updates.paymentStatus}\n`;
+             }
+             
+             message += `\nID: <code>${id}</code>`;
+             sendTelegramNotification(message);
+         }
      } else {
          throw new Error("Database not connected.");
      }

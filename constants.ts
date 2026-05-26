@@ -7,6 +7,7 @@ export const DEFAULT_SERVICES = [
   { id: '4', name: 'Machine Cut & Scissor', price: 250, durationMinutes: 60 },
   { id: '5', name: 'Machine Cheesecob & Beard Trim', price: 100, durationMinutes: 60 },
   { id: '6', name: 'Blade Cheesecob & Beard Trim', price: 150, durationMinutes: 60 },
+  { id: '7', name: 'Blade Fade and Scissors', price: 300, durationMinutes: 60 },
 ];
 
 export const DEFAULT_HOURS: Record<number, WorkingHours> = {

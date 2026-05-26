@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { PaystackButton } from 'react-paystack';
 import { Link } from 'react-router-dom';
 import { v4 as uuidv4 } from 'uuid';
-import { User, Calendar, Scissors, CreditCard, CheckCircle, Clock, ArrowLeft, LogOut, ChevronRight, ChevronLeft, MapPin, Check, AlertCircle, RotateCcw } from 'lucide-react';
+import { User, Calendar, Scissors, CreditCard, CheckCircle, Clock, ArrowLeft, LogOut, ChevronRight, ChevronLeft, Check, AlertCircle, RotateCcw } from 'lucide-react';
 import { api } from '../services/api';
 import { Client, ServiceItem, Booking, PaymentMethod, PaymentStatus, BookingStatus, Blockout } from '../types';
 import { format, addDays, startOfToday, getDay } from 'date-fns';
@@ -238,7 +238,9 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
     setError(null);
     
     try {
-      const total = selectedService.price;
+      const basePrice = selectedService.price;
+      const serviceFee = 50;
+      const total = basePrice + serviceFee;
       const deposit = depositOption === 'deposit' ? total / 2 : total;
       
       // Determine payment status based on deposit amount
@@ -283,9 +285,6 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
       
       // Payment succeeded but booking creation failed - critical error
       const errorMessage = e.message && e.message.includes('Database not connected')
-        ? `Payment successful (Ref: ${response.reference}) but booking failed. Please contact support with this reference.`
-        : `Payment successful (Ref: ${response.reference}) but booking failed. Please contact support.`;
-      
       setError(errorMessage);
       notify.error(errorMessage);
     } finally {
@@ -293,8 +292,10 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
     }
   };
 
+
+
   const handlePaymentClose = () => {
-    const message = "Payment was cancelled. Please try again or select 'Pay at Shop'.";
+    const message = "Payment was cancelled. Please try again to complete your booking.";
     setError(message);
     setIsProcessingPayment(false);
     notify.warning(message);
@@ -302,7 +303,7 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
 
   const handlePaymentError = (error: any) => {
     console.error("Payment error:", error);
-    const message = "Payment failed. Please try again or select 'Pay at Shop'.";
+    const message = "Payment failed. Please try again or use a different card.";
     setError(message);
     setIsProcessingPayment(false);
     notify.error(message);
@@ -312,96 +313,21 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
   const phoneDigits = client.phone.replace(/\D/g, '') || '0000000000';
   const paystackEmail = `${phoneDigits}@example.com`; // still phone-based, satisfies email format
   
-  // Get and validate split code
+  // Get and validate split code or subaccount
   const rawSplitCode = import.meta.env.VITE_PAYSTACK_SPLIT_CODE?.trim();
   const paystackSplitCode = rawSplitCode && rawSplitCode.startsWith('SPL_') 
     ? rawSplitCode 
     : rawSplitCode || undefined;
 
-  // Debug logging for Paystack configuration (remove after verification)
-  useEffect(() => {
-    if (paymentMethod === PaymentMethod.ONLINE) {
-      console.log('=== Paystack Configuration Debug ===');
-      console.log('Public Key:', import.meta.env.VITE_PAYSTACK_PUBLIC_KEY ? `${import.meta.env.VITE_PAYSTACK_PUBLIC_KEY.substring(0, 20)}...` : 'MISSING');
-      console.log('Raw Split Code:', rawSplitCode || 'NOT SET');
-      console.log('Validated Split Code:', paystackSplitCode || 'NOT SET');
-      console.log('Split Code Length:', paystackSplitCode?.length || 0);
-      console.log('Split Code Type:', typeof paystackSplitCode);
-      if (rawSplitCode && !rawSplitCode.startsWith('SPL_')) {
-        console.warn('⚠️ WARNING: Split code does not start with "SPL_". Format should be: SPL_xxxxxxxxxx');
-      }
-      console.log('===================================');
-    }
-  }, [paymentMethod, paystackSplitCode, rawSplitCode]);
+  const rawSubaccount = import.meta.env.VITE_PAYSTACK_SUBACCOUNT?.trim();
+  const paystackSubaccount = rawSubaccount && rawSubaccount.startsWith('ACCT_')
+    ? rawSubaccount
+    : rawSubaccount || undefined;
 
-  // Handle cash (pay at shop) bookings - creates booking without online payment
-  const handleCashBooking = async () => {
-    if (!selectedService || !selectedDate || !selectedSlot) return;
 
-    setIsLoading(true);
-    setError(null);
-
-    try {
-      const total = selectedService.price;
-      // For cash payments, we treat everything as payable at the shop
-      const deposit = 0;
-
-      const booking = await api.createBooking({
-        clientName: client.name,
-        clientPhone: client.phone,
-        date: selectedDate,
-        timeSlot: selectedSlot,
-        serviceId: selectedService.id,
-        serviceName: selectedService.name,
-        durationMinutes: selectedService.durationMinutes,
-        amount: total,
-        depositAmount: deposit,
-        paymentMethod: PaymentMethod.CASH,
-        paymentStatus: PaymentStatus.NOT_PAID,
-        paymentReference: undefined,
-        transactionId: undefined
-      }, rescheduleBooking?.id);
-
-      if (rescheduleBooking) {
-        try {
-          await api.updateBooking(rescheduleBooking.id, { status: BookingStatus.CANCELLED });
-        } catch (e) {
-          console.warn("Could not auto-cancel old booking during reschedule (cash flow)", e);
-        }
-      }
-
-      setFinalBooking(booking);
-      setStep(5);
-      const message = rescheduleBooking 
-        ? 'Booking rescheduled successfully! Please pay at the shop.'
-        : 'Booking confirmed! Please pay at the shop.';
-      notify.success(message);
-    } catch (e: any) {
-      console.error(e);
-      let errorMessage: string;
-      if (e.message && e.message.includes('Database not connected')) {
-        errorMessage = 'Unable to create booking at the moment. Please try again later or contact the shop.';
-      } else {
-        errorMessage = 'Something went wrong while creating your booking. Please try again.';
-      }
-      setError(errorMessage);
-      notify.error(errorMessage);
-      api.refresh();
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
-  // Main handleBook - routes to cash or online payment flow
+  // Main handleBook - no longer used for online flow as PaystackButton handles it
   const handleBook = () => {
     if (!selectedService || !selectedDate || !selectedSlot || !paymentMethod || !depositOption) return;
-    
-    // For cash payments, create booking immediately
-    if (paymentMethod === PaymentMethod.CASH) {
-      handleCashBooking();
-    }
-    // For online payments, PaystackButton will trigger payment, then handlePaymentSuccess will create booking
-    // So we don't do anything here - the PaystackButton handles it
   };
 
   // Success Screen
@@ -631,44 +557,24 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
                  <Card className="p-6 bg-gradient-to-br from-[#1C1C1E] to-[#2C2C2E] text-white border-none shadow-xl relative overflow-hidden">
                     <div className="relative z-10">
                         <div className="text-white/60 text-xs font-bold uppercase tracking-widest mb-1">Total to Pay</div>
-                        <div className="text-4xl font-bold tracking-tight">R{selectedService.price}</div>
-                        <div className="mt-6 flex items-center gap-2 text-white/80 text-sm font-medium bg-white/10 w-fit px-3 py-1.5 rounded-full backdrop-blur-md">
-                            <Scissors size={14} />
-                            {selectedService.name}
+                        <div className="text-4xl font-bold tracking-tight">R{selectedService.price + 50}</div>
+                        <div className="mt-4 flex flex-col gap-1 text-sm text-white/80">
+                            <div className="flex justify-between">
+                                <span>{selectedService.name}</span>
+                                <span>R{selectedService.price}</span>
+                            </div>
+                            <div className="flex justify-between">
+                                <span>Service Fee</span>
+                                <span>R50</span>
+                            </div>
                         </div>
                     </div>
                  </Card>
 
-                 {/* Deposit Options */}
-                 <div className="space-y-3">
-                    <label className="block text-[13px] font-semibold text-[#8E8E93] uppercase tracking-wide px-2">Payment Amount</label>
-                    <div className="grid grid-cols-2 gap-3">
-                        <button
-                            onClick={() => setDepositOption('deposit')}
-                            className={`p-4 rounded-2xl border transition-all text-left ${depositOption === 'deposit' ? 'border-[#007AFF] ring-1 ring-[#007AFF] bg-white shadow-sm' : 'border-transparent bg-white shadow-sm hover:bg-[#F2F2F7]'}`}
-                        >
-                            <div className="text-[13px] font-bold text-[#8E8E93] uppercase tracking-wide mb-1">Pay Deposit</div>
-                            <div className="text-xl font-bold text-[#1C1C1E]">50% (R{(selectedService.price / 2).toFixed(2)})</div>
-                            <div className="text-[12px] text-[#8E8E93] mt-1">Secure your booking now</div>
-                        </button>
-                        <button
-                            onClick={() => setDepositOption('full')}
-                            className={`p-4 rounded-2xl border transition-all text-left ${depositOption === 'full' ? 'border-[#007AFF] ring-1 ring-[#007AFF] bg-white shadow-sm' : 'border-transparent bg-white shadow-sm hover:bg-[#F2F2F7]'}`}
-                        >
-                            <div className="text-[13px] font-bold text-[#8E8E93] uppercase tracking-wide mb-1">Pay Full</div>
-                            <div className="text-xl font-bold text-[#1C1C1E]">R{selectedService.price.toFixed(2)}</div>
-                            <div className="text-[12px] text-[#8E8E93] mt-1">No balance on arrival</div>
-                        </button>
-                    </div>
-                 </div>
-
                  <div className="space-y-3">
                     <label className="block text-[13px] font-semibold text-[#8E8E93] uppercase tracking-wide px-2">Payment Method</label>
                     <div className="space-y-3">
-                        <button
-                            onClick={() => setPaymentMethod(PaymentMethod.ONLINE)}
-                            className={`w-full p-4 rounded-2xl flex items-center justify-between transition-all bg-white shadow-sm border ${paymentMethod === PaymentMethod.ONLINE ? 'border-[#007AFF] ring-1 ring-[#007AFF]' : 'border-transparent'}`}
-                        >
+                        <div className="w-full p-4 rounded-2xl flex items-center justify-between transition-all bg-white shadow-sm border border-[#007AFF] ring-1 ring-[#007AFF]">
                             <div className="flex items-center gap-4">
                                 <div className="w-10 h-10 rounded-full bg-[#007AFF]/10 flex items-center justify-center text-[#007AFF]">
                                     <CreditCard size={20} />
@@ -678,8 +584,8 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
                                     <div className="text-[13px] text-[#8E8E93]">Secure payment via Paystack</div>
                                 </div>
                             </div>
-                            {paymentMethod === PaymentMethod.ONLINE && <Check size={20} className="text-[#007AFF]" />}
-                        </button>
+                            <Check size={20} className="text-[#007AFF]" />
+                        </div>
                     </div>
                  </div>
 
@@ -689,7 +595,7 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
                         {!import.meta.env.VITE_PAYSTACK_PUBLIC_KEY ? (
                             <div className="p-4 bg-[#FF9500]/10 text-[#FF9500] rounded-2xl flex items-center gap-3 text-sm font-medium">
                                 <AlertCircle size={20} />
-                                Payment system not configured. Please contact support or select 'Pay at Shop'.
+                                Payment system is currently unavailable. Please try again later.
                             </div>
                         ) : (
                             <div className="space-y-3">
@@ -699,31 +605,44 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
                                         Invalid split code format. Split code must start with "SPL_". Current value: "{rawSplitCode.substring(0, 20)}..."
                                     </div>
                                 )}
-                                {paymentMethod === PaymentMethod.ONLINE && !paystackSplitCode && !rawSplitCode && (
-                                    <div className="p-3 bg-[#FF9500]/10 text-[#FF9500] rounded-xl text-sm font-medium">
-                                        Warning: No Paystack split code set. Add VITE_PAYSTACK_SPLIT_CODE to enable revenue split.
-                                    </div>
-                                )}
                                 <div className="[&>button]:w-full [&>button]:h-14 [&>button]:bg-[#007AFF] [&>button]:text-white [&>button]:rounded-full [&>button]:font-semibold [&>button]:text-lg [&>button]:shadow-xl [&>button]:hover:bg-[#0066CC] [&>button]:transition-all [&>button]:disabled:opacity-50 [&>button]:disabled:cursor-not-allowed">
-                                    <PaystackButton
-                                        publicKey={import.meta.env.VITE_PAYSTACK_PUBLIC_KEY}
-                                        email={paystackEmail} // synthesized from phone to satisfy email format
-                                        amount={Math.round((depositOption === 'deposit' ? selectedService.price * 0.5 : selectedService.price) * 100)} // cents
-                                        currency="ZAR"
-                                        reference={`WAYLINS-${Date.now()}-${uuidv4().substring(0, 8)}`}
-                                        metadata={{ phone: phoneDigits } as any}
-                                        split_code={paystackSplitCode || undefined}
-                                        text={
-                                          isProcessingPayment
-                                            ? "Processing..."
-                                            : rescheduleBooking
-                                              ? `Pay & Reschedule (R${depositOption === 'deposit' ? selectedService.price / 2 : selectedService.price})`
-                                              : `Pay Now (R${depositOption === 'deposit' ? selectedService.price / 2 : selectedService.price})`
-                                        }
-                                        onSuccess={handlePaymentSuccess}
-                                        onClose={handlePaymentClose}
-                                        disabled={isProcessingPayment}
-                                    />
+                                    {(() => {
+                                        const basePrice = selectedService.price;
+                                        const total = basePrice + 50;
+                                        const deposit = depositOption === 'deposit' ? total / 2 : total;
+                                        const creatorShare = 50 + basePrice * 0.10;
+                                        // Cap creator's split at total deposit if it's a deposit payment to prevent invalid transaction amounts on cheap services
+                                        const creatorShareForTransaction = depositOption === 'deposit'
+                                            ? Math.min(creatorShare, deposit)
+                                            : creatorShare;
+
+                                        return (
+                                            <>
+                                            <PaystackButton
+                                                publicKey={import.meta.env.VITE_PAYSTACK_PUBLIC_KEY}
+                                                email={paystackEmail} // synthesized from phone to satisfy email format
+                                                amount={Math.round(deposit * 100)} // cents
+                                                currency="ZAR"
+                                                reference={`WAYLINS-${Date.now()}-${uuidv4().substring(0, 8)}`}
+                                                metadata={{ phone: phoneDigits } as any}
+                                                split_code={!paystackSubaccount ? paystackSplitCode || undefined : undefined}
+                                                subaccount={paystackSubaccount || undefined}
+                                                transaction_charge={paystackSubaccount ? Math.round(creatorShareForTransaction * 100) : undefined}
+                                                bearer={paystackSubaccount ? "subaccount" : undefined}
+                                                text={
+                                                  isProcessingPayment
+                                                    ? "Processing..."
+                                                    : rescheduleBooking
+                                                      ? `Pay & Reschedule (R${deposit})`
+                                                      : `Pay Now (R${deposit})`
+                                                }
+                                                onSuccess={handlePaymentSuccess}
+                                                onClose={handlePaymentClose}
+                                                disabled={isProcessingPayment}
+                                            />
+                                            </>
+                                        );
+                                    })()}
                                 </div>
                                 {isProcessingPayment && (
                                     <div className="text-center text-sm text-[#8E8E93] font-medium">
