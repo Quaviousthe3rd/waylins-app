@@ -284,7 +284,9 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
       api.refresh(); 
       
       // Payment succeeded but booking creation failed - critical error
-      const errorMessage = e.message && e.message.includes('Database not connected')
+      const errorMessage = e?.message?.includes('Database not connected')
+        ? 'Payment received but we could not save your booking. Do NOT pay again. Contact the shop with this reference: ' + (response?.reference ?? 'unknown')
+        : 'Payment received but booking failed. Do NOT pay again. Contact the shop with this reference: ' + (response?.reference ?? 'unknown');
       setError(errorMessage);
       notify.error(errorMessage);
     } finally {
