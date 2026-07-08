@@ -18,9 +18,17 @@ service cloud.firestore {
         request.auth.token.email == 'qaabilmullah@gmail.com';
     }
 
+    // paymentConfig (Paystack subaccount routing) is server-only: no client
+    // read or write. Cloud Functions use the Admin SDK, which bypasses rules;
+    // the owner edits it via the Firebase console.
     match /settings/{doc} {
-      allow read: if true;
-      allow write: if isAdmin();
+      allow read: if doc != 'paymentConfig';
+      allow write: if isAdmin() && doc != 'paymentConfig';
+    }
+
+    // pendingPayments (payment intents) are written by initTransaction only.
+    match /pendingPayments/{reference} {
+      allow read, write: if false;
     }
 
     match /bookings/{id} {
