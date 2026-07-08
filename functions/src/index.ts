@@ -24,13 +24,73 @@ export const ping = onRequest(
 
 // --- Money model (all authoritative, server-side) ---
 // Prices are stored in RAND in Firestore; Paystack amounts are integer CENTS.
-// total charged  = servicePrice + R50 service fee
-// barber (subaccount) receives servicePrice + R15
-// owner (main account) flat take = R35 = 3500 cents (transaction_charge),
-// and Paystack's processing fee comes out of the owner side (bearer: account).
-const SERVICE_FEE_RAND = 50;
-const OWNER_GROSS_RAND = 35;
-const OWNER_GROSS_CENTS = OWNER_GROSS_RAND * 100;
+//
+// ownerCut          = exactly 10% of servicePrice; the owner receives ONLY
+//                     this — all rounding surplus flows to the barber.
+// charge (total)    = (servicePrice + barberBuffer + ownerCut + feeFlat)
+//                     / (1 - feePercent), rounded UP to the next roundTo.
+// transaction_charge = ownerCut + estimatedPaystackFee (cents),
+//                     bearer: "account", so the main account nominally takes
+//                     ownerCut + fee, pays Paystack's actual fee out of it,
+//                     and nets exactly ownerCut.
+// barberNet         = charge - transaction_charge (subaccount receives this;
+//                     always >= servicePrice + barberBuffer).
+//
+// Fee params come from settings/paymentConfig with these defaults:
+const DEFAULT_FEE_PERCENT = 0.029; // Paystack 2.9%
+const DEFAULT_FEE_FLAT_RAND = 1; // + R1 per transaction
+const DEFAULT_ROUND_TO_RAND = 5; // charge rounded up to next R5
+const DEFAULT_BARBER_BUFFER_RAND = 5;
+
+interface FeeConfig {
+  feePercent: number;
+  feeFlatCents: number;
+  roundToCents: number;
+  barberBufferCents: number;
+}
+
+const readFeeConfig = (payCfg: any): FeeConfig => ({
+  feePercent: Number(payCfg?.feePercent) || DEFAULT_FEE_PERCENT,
+  feeFlatCents: Math.round((Number(payCfg?.feeFlatRand) || DEFAULT_FEE_FLAT_RAND) * 100),
+  roundToCents: Math.round((Number(payCfg?.roundToRand) || DEFAULT_ROUND_TO_RAND) * 100),
+  barberBufferCents: Math.round(
+    (Number(payCfg?.barberBufferRand) || DEFAULT_BARBER_BUFFER_RAND) * 100
+  ),
+});
+
+interface Quote {
+  baseCents: number;
+  ownerCutCents: number;
+  chargeCents: number;
+  estimatedFeeCents: number;
+  transactionChargeCents: number;
+  barberNetCents: number;
+  serviceFeeCents: number;
+}
+
+const computeQuote = (baseCents: number, cfg: FeeConfig): Quote => {
+  const ownerCutCents = Math.round(baseCents * 0.1);
+  const preFeeCents =
+    baseCents + cfg.barberBufferCents + ownerCutCents + cfg.feeFlatCents;
+  const grossedUp = preFeeCents / (1 - cfg.feePercent);
+  const chargeCents = Math.ceil(grossedUp / cfg.roundToCents) * cfg.roundToCents;
+  // Paystack's actual fee formula, estimated with the configured params.
+  const estimatedFeeCents =
+    Math.round(chargeCents * cfg.feePercent) + cfg.feeFlatCents;
+  const transactionChargeCents = ownerCutCents + estimatedFeeCents;
+  const barberNetCents = chargeCents - transactionChargeCents;
+  return {
+    baseCents,
+    ownerCutCents,
+    chargeCents,
+    estimatedFeeCents,
+    transactionChargeCents,
+    barberNetCents,
+    serviceFeeCents: chargeCents - baseCents,
+  };
+};
+
+const randFromCents = (c: number): number => c / 100;
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
@@ -135,9 +195,11 @@ export const initTransaction = onCall(
     }
 
     // 5. Amounts.
-    const totalRand = basePriceRand + SERVICE_FEE_RAND;
-    const amountCents = Math.round(totalRand * 100);
-    const barberRand = basePriceRand + 15;
+    const quote = computeQuote(Math.round(basePriceRand * 100), readFeeConfig(paySnap.data()));
+    if (quote.barberNetCents < quote.baseCents) {
+      // Should be impossible by construction; refuse rather than short the barber.
+      throw new HttpsError("internal", "Pricing configuration error.");
+    }
 
     // 6. Record the intent before contacting Paystack.
     const reference = makeReference();
@@ -156,12 +218,13 @@ export const initTransaction = onCall(
       amounts: {
         currency: "ZAR",
         basePriceRand,
-        serviceFeeRand: SERVICE_FEE_RAND,
-        totalRand,
-        amountCents,
-        barberRand,
-        ownerGrossRand: OWNER_GROSS_RAND,
-        transactionChargeCents: OWNER_GROSS_CENTS,
+        ownerCutRand: randFromCents(quote.ownerCutCents),
+        serviceFeeRand: randFromCents(quote.serviceFeeCents),
+        totalRand: randFromCents(quote.chargeCents),
+        barberNetRand: randFromCents(quote.barberNetCents),
+        estimatedFeeRand: randFromCents(quote.estimatedFeeCents),
+        amountCents: quote.chargeCents,
+        transactionChargeCents: quote.transactionChargeCents,
       },
       createdAt: FieldValue.serverTimestamp(),
     });
@@ -175,12 +238,12 @@ export const initTransaction = onCall(
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        amount: amountCents,
+        amount: quote.chargeCents,
         currency: "ZAR",
         email: "bookings@waylins-37532.web.app",
         reference,
         subaccount: subaccountCode,
-        transaction_charge: OWNER_GROSS_CENTS,
+        transaction_charge: quote.transactionChargeCents,
         bearer: "account",
         metadata: {
           reference,
@@ -191,8 +254,9 @@ export const initTransaction = onCall(
           date,
           timeSlot,
           baseAmount: basePriceRand,
-          serviceFee: SERVICE_FEE_RAND,
-          ownerGross: OWNER_GROSS_RAND,
+          serviceFee: randFromCents(quote.serviceFeeCents),
+          ownerCut: randFromCents(quote.ownerCutCents),
+          barberNet: randFromCents(quote.barberNetCents),
         },
       }),
     });
@@ -212,3 +276,31 @@ export const initTransaction = onCall(
     return { reference, authorization_url: body.data.authorization_url };
   }
 );
+
+// Public quote: what a booking will cost and how it splits, computed with the
+// same code path as initTransaction. Never exposes the subaccount code.
+export const quoteService = onCall(async (request) => {
+  const { serviceId } = request.data ?? {};
+  if (typeof serviceId !== "string" || !serviceId.trim()) {
+    throw new HttpsError("invalid-argument", "serviceId is required.");
+  }
+  const storeSnap = await db.doc("settings/storeConfig").get();
+  const service = (storeSnap.data()?.services ?? []).find(
+    (s: any) => s.id === serviceId
+  );
+  if (!service) {
+    throw new HttpsError("not-found", "Unknown service.");
+  }
+  const paySnap = await db.doc("settings/paymentConfig").get();
+  const quote = computeQuote(
+    Math.round(Number(service.price) * 100),
+    readFeeConfig(paySnap.data())
+  );
+  return {
+    base: randFromCents(quote.baseCents),
+    serviceFee: randFromCents(quote.serviceFeeCents),
+    total: randFromCents(quote.chargeCents),
+    barberNet: randFromCents(quote.barberNetCents),
+    ownerCut: randFromCents(quote.ownerCutCents),
+  };
+});
