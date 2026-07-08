@@ -2,7 +2,8 @@ import { setGlobalOptions } from "firebase-functions/v2";
 import { onRequest, onCall, HttpsError } from "firebase-functions/v2/https";
 import { defineSecret } from "firebase-functions/params";
 import { initializeApp } from "firebase-admin/app";
-import { getFirestore, FieldValue } from "firebase-admin/firestore";
+import { getFirestore, FieldValue, Timestamp } from "firebase-admin/firestore";
+import { createHmac, timingSafeEqual } from "crypto";
 
 // All functions run in europe-west1.
 setGlobalOptions({ region: "europe-west1" });
@@ -149,6 +150,28 @@ export const initTransaction = onCall(
     const basePriceRand = Number(service.price);
     if (!Number.isFinite(basePriceRand) || basePriceRand <= 0) {
       throw new HttpsError("failed-precondition", "Service has an invalid price.");
+    }
+
+    // 2b. Lazy cleanup: delete pendingPayments older than 30 minutes.
+    //     Runs on every init, so no scheduler is needed. Abandoned intents
+    //     never blocked slots anyway (only bookings do), but this keeps the
+    //     collection from growing without bound. Best-effort: a cleanup
+    //     failure must never block a paying customer.
+    try {
+      const cutoff = Timestamp.fromMillis(Date.now() - 30 * 60 * 1000);
+      const stale = await db
+        .collection("pendingPayments")
+        .where("createdAt", "<", cutoff)
+        .limit(100)
+        .get();
+      if (!stale.empty) {
+        const batch = db.batch();
+        stale.docs.forEach((d) => batch.delete(d.ref));
+        await batch.commit();
+        console.log(`Cleaned up ${stale.size} expired pendingPayments.`);
+      }
+    } catch (e) {
+      console.error("pendingPayments cleanup failed (non-fatal)", e);
     }
 
     // 3. Recheck the slot against non-cancelled bookings and blockouts
@@ -304,3 +327,240 @@ export const quoteService = onCall(async (request) => {
     ownerCut: randFromCents(quote.ownerCutCents),
   };
 });
+
+// --- Telegram (server-side, NEW bot) ---
+// Sent only AFTER Firestore writes commit; a Telegram failure is logged and
+// never fails the webhook response.
+const sendTelegram = async (text: string): Promise<void> => {
+  try {
+    const resp = await fetch(
+      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN.value()}/sendMessage`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chat_id: TELEGRAM_CHAT_ID.value(),
+          text,
+          parse_mode: "HTML",
+        }),
+      }
+    );
+    if (!resp.ok) {
+      console.error("Telegram API error", resp.status, await resp.text().catch(() => ""));
+    }
+  } catch (e) {
+    console.error("Telegram send failed (non-fatal)", e);
+  }
+};
+
+const escapeHTML = (s: string): string =>
+  String(s ?? "").replace(/[&<>]/g, (m) =>
+    m === "&" ? "&amp;" : m === "<" ? "&lt;" : "&gt;"
+  );
+
+// --- Paystack webhook ---
+// The single source of truth for paid bookings. Paystack POSTs events here;
+// we verify the HMAC-SHA512 signature over the RAW body (never re-serialized
+// JSON), act only on charge.success, and are idempotent on the transaction
+// reference: ledger/{reference} is created exactly once via tx.create(),
+// which throws ALREADY_EXISTS on Paystack's retries.
+export const paystackWebhook = onRequest(
+  { secrets: [PAYSTACK_SECRET_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID] },
+  async (req, res) => {
+    // 1. Signature check — 401 and write nothing on any failure.
+    const signature = req.headers["x-paystack-signature"];
+    const rawBody: Buffer | undefined = (req as any).rawBody;
+    if (typeof signature !== "string" || !signature || !rawBody) {
+      res.status(401).send("unauthorized");
+      return;
+    }
+    const expected = createHmac("sha512", PAYSTACK_SECRET_KEY.value())
+      .update(rawBody)
+      .digest("hex");
+    const sigBuf = Buffer.from(signature, "utf8");
+    const expBuf = Buffer.from(expected, "utf8");
+    if (sigBuf.length !== expBuf.length || !timingSafeEqual(sigBuf, expBuf)) {
+      res.status(401).send("unauthorized");
+      return;
+    }
+
+    let event: any;
+    try {
+      event = JSON.parse(rawBody.toString("utf8"));
+    } catch {
+      // Signed but unparseable — acknowledge so Paystack stops retrying.
+      res.status(200).send("ignored");
+      return;
+    }
+
+    // 2. Only charge.success does work; everything else is acked fast.
+    if (event?.event !== "charge.success") {
+      res.status(200).send("ok");
+      return;
+    }
+
+    const data = event.data ?? {};
+    const reference: string = String(data.reference ?? "");
+    if (!reference) {
+      res.status(200).send("ok");
+      return;
+    }
+
+    const ledgerRef = db.doc(`ledger/${reference}`);
+    const chargedCents = Number(data.amount) || 0;
+    const paystackFeeActualRand =
+      data.fees != null ? randFromCents(Number(data.fees) || 0) : null;
+
+    // Base ledger fields shared by every outcome. The raw event is stored
+    // verbatim for reconciliation.
+    const ledgerBase = {
+      reference,
+      transactionId: data.id != null ? String(data.id) : null,
+      charged: randFromCents(chargedCents),
+      paystackFeeActual: paystackFeeActualRand,
+      event,
+      createdAt: FieldValue.serverTimestamp(),
+    };
+
+    // 3. Idempotency fast-path (the transaction below also enforces this
+    //    atomically via tx.create()).
+    if ((await ledgerRef.get()).exists) {
+      res.status(200).send("ok");
+      return;
+    }
+
+    const pendingSnap = await db.doc(`pendingPayments/${reference}`).get();
+
+    // 4. Money arrived with no matching intent: record it, alert, ack.
+    if (!pendingSnap.exists) {
+      console.error(`charge.success for unknown reference ${reference}`);
+      try {
+        await ledgerRef.create({ ...ledgerBase, status: "UNMATCHED_PAYMENT" });
+      } catch (e: any) {
+        if (e?.code === 6 /* ALREADY_EXISTS */) { res.status(200).send("ok"); return; }
+        throw e;
+      }
+      await sendTelegram(
+        `⚠️ <b>Unmatched Paystack payment</b>\nReference: <code>${escapeHTML(reference)}</code>\nAmount: R${randFromCents(chargedCents)}\nNo pending booking found — investigate in the Paystack dashboard.`
+      );
+      res.status(200).send("ok");
+      return;
+    }
+
+    const pending = pendingSnap.data() as any;
+    const b = pending.booking ?? {};
+    const amounts = pending.amounts ?? {};
+    const bookingFields = {
+      clientName: String(b.clientName ?? ""),
+      serviceName: String(b.serviceName ?? ""),
+      date: String(b.date ?? ""),
+      timeSlot: String(b.timeSlot ?? ""),
+    };
+    const ledgerFull = {
+      ...ledgerBase,
+      ...bookingFields,
+      estimatedFee: amounts.estimatedFeeRand ?? null,
+      barberNet: amounts.barberNetRand ?? null,
+    };
+
+    // 5. The charge must match the quoted amount EXACTLY (integer cents).
+    if (chargedCents !== Number(amounts.amountCents)) {
+      console.error(
+        `AMOUNT_MISMATCH ${reference}: charged ${chargedCents}, expected ${amounts.amountCents}`
+      );
+      try {
+        await ledgerRef.create({ ...ledgerFull, bookingId: null, status: "AMOUNT_MISMATCH" });
+      } catch (e: any) {
+        if (e?.code === 6) { res.status(200).send("ok"); return; }
+        throw e;
+      }
+      await sendTelegram(
+        `⚠️ <b>Paystack amount mismatch</b>\nReference: <code>${escapeHTML(reference)}</code>\nCharged: R${randFromCents(chargedCents)} — expected R${randFromCents(Number(amounts.amountCents) || 0)}\nClient: ${escapeHTML(bookingFields.clientName)}\nNo booking was created. Review and refund/adjust manually.`
+      );
+      res.status(200).send("ok");
+      return;
+    }
+
+    // 6. Happy path — one Firestore transaction:
+    //    - re-check the slot (someone may have booked between init & webhook)
+    //    - create the ledger row (tx.create = atomic idempotency)
+    //    - write the booking ONLY if the slot is still free
+    //    Money is never silently dropped: a lost race becomes a
+    //    SLOT_TAKEN_REFUND ledger row + Telegram alert for a manual refund.
+    const bookingRef = db.collection("bookings").doc();
+    const durationMinutes = Number(b.durationMinutes) || 60;
+    const slotStart = toMinutes(String(b.timeSlot ?? "00:00"));
+    const slotEnd = slotStart + durationMinutes;
+
+    let slotTaken = false;
+    try {
+      await db.runTransaction(async (tx) => {
+        const sameDay = await tx.get(
+          db.collection("bookings").where("date", "==", b.date)
+        );
+        const taken = sameDay.docs.some((d) => {
+          const other = d.data();
+          if (other.status === "Cancelled") return false;
+          const oStart = toMinutes(String(other.timeSlot ?? "00:00"));
+          const oEnd = oStart + (Number(other.durationMinutes) || 60);
+          return overlaps(slotStart, slotEnd, oStart, oEnd);
+        });
+
+        if (taken) {
+          slotTaken = true;
+          tx.create(ledgerRef, {
+            ...ledgerFull,
+            bookingId: null,
+            status: "SLOT_TAKEN_REFUND",
+          });
+        } else {
+          tx.create(ledgerRef, {
+            ...ledgerFull,
+            bookingId: bookingRef.id,
+            status: "PAID_BOOKED",
+          });
+          tx.set(bookingRef, {
+            id: bookingRef.id,
+            clientName: bookingFields.clientName,
+            clientPhone: String(b.clientPhone ?? ""),
+            date: bookingFields.date,
+            timeSlot: bookingFields.timeSlot,
+            serviceId: String(b.serviceId ?? ""),
+            serviceName: bookingFields.serviceName,
+            durationMinutes,
+            amount: amounts.totalRand ?? randFromCents(chargedCents),
+            depositAmount: amounts.totalRand ?? randFromCents(chargedCents),
+            paymentMethod: "Online (Paystack)",
+            paymentStatus: "Paid",
+            status: "Confirmed",
+            createdAt: new Date().toISOString(),
+            paymentReference: reference,
+            transactionId: data.id != null ? String(data.id) : "",
+          });
+        }
+        tx.delete(pendingSnap.ref);
+      });
+    } catch (e: any) {
+      if (e?.code === 6 /* ALREADY_EXISTS: concurrent retry won the race */) {
+        res.status(200).send("ok");
+        return;
+      }
+      // Genuine write failure: 500 so Paystack retries later.
+      console.error(`webhook transaction failed for ${reference}`, e);
+      res.status(500).send("error");
+      return;
+    }
+
+    // 7. Telegram AFTER the writes; failure is logged only.
+    if (slotTaken) {
+      await sendTelegram(
+        `🔴 <b>Paid but slot taken — refund needed</b>\nClient: ${escapeHTML(bookingFields.clientName)} (${escapeHTML(String(b.clientPhone ?? ""))})\nService: ${escapeHTML(bookingFields.serviceName)}\n${escapeHTML(bookingFields.date)} at ${escapeHTML(bookingFields.timeSlot)}\nPaid: R${randFromCents(chargedCents)}\nReference: <code>${escapeHTML(reference)}</code>\nRefund manually in the Paystack dashboard.`
+      );
+    } else {
+      await sendTelegram(
+        `✅ <b>New paid booking</b>\nClient: ${escapeHTML(bookingFields.clientName)} (${escapeHTML(String(b.clientPhone ?? ""))})\nService: ${escapeHTML(bookingFields.serviceName)}\nWhen: ${escapeHTML(bookingFields.date)} at ${escapeHTML(bookingFields.timeSlot)}\nAmount: R${randFromCents(chargedCents)}\nRef: <code>${escapeHTML(reference)}</code>`
+      );
+    }
+    res.status(200).send("ok");
+  }
+);
