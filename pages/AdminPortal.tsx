@@ -6,11 +6,12 @@ import { Button } from '../components/ui/Button';
 import { Card } from '../components/ui/Card';
 import { Calendar, List, Settings, Scissors, Clock, LogOut, Plus, Trash, Ban, Search, ChevronRight, CreditCard, RefreshCw, X, Edit2, Phone, Menu, Loader2 } from 'lucide-react';
 import { format, isBefore, parseISO } from 'date-fns';
-import { DEFAULT_HOURS, STORAGE_KEYS } from '../constants';
+import { DEFAULT_HOURS } from '../constants';
 import { notify } from '../services/notifications';
 
 // --- Admin Login ---
-const AdminLogin: React.FC<{ onLogin: () => void }> = ({ onLogin }) => {
+const AdminLogin: React.FC = () => {
+  const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [isLoading, setIsLoading] = useState(false);
@@ -19,15 +20,17 @@ const AdminLogin: React.FC<{ onLogin: () => void }> = ({ onLogin }) => {
     e.preventDefault();
     setIsLoading(true);
     setError('');
-    
-    // Security: Artificial delay to prevent brute-force
-    await new Promise(resolve => setTimeout(resolve, 800));
 
-    if (api.login(password)) {
-      localStorage.setItem(STORAGE_KEYS.ADMIN_SESSION, 'true');
-      onLogin();
-    } else {
-      setError('Incorrect Passcode');
+    try {
+      const ok = await api.login(email, password);
+      if (!ok) {
+        setError('This account is not authorized for admin access');
+        setIsLoading(false);
+        setPassword('');
+      }
+      // On success the auth state listener in AdminPortal unlocks the portal.
+    } catch (err) {
+      setError('Sign in failed. Check your email and password.');
       setIsLoading(false);
       setPassword('');
     }
@@ -41,24 +44,30 @@ const AdminLogin: React.FC<{ onLogin: () => void }> = ({ onLogin }) => {
             <Settings className="text-white" size={36} />
           </div>
           <h2 className="text-2xl font-bold text-[#1C1C1E] tracking-tight mb-1">Manager Access</h2>
-          <p className="text-[#8E8E93] mb-8 text-sm">Enter your passcode to continue</p>
-          
+          <p className="text-[#8E8E93] mb-8 text-sm">Sign in with your admin account</p>
+
           <form onSubmit={handleLogin} className="space-y-4">
-             <div className="relative">
-                <input
-                    type="password"
-                    value={password}
-                    onChange={e => setPassword(e.target.value)}
-                    className="w-full p-4 bg-[#F2F2F7] rounded-xl border-none outline-none focus:ring-2 focus:ring-[#007AFF]/20 text-[#1C1C1E] text-center tracking-[0.5em] text-xl transition-all font-bold placeholder:font-normal placeholder:tracking-normal placeholder:text-base disabled:opacity-50"
-                    placeholder="••••"
-                    autoFocus
-                    maxLength={8}
-                    inputMode="numeric"
-                    pattern="[0-9]*"
-                    autoComplete="current-password"
-                    disabled={isLoading}
-                />
-             </div>
+             <input
+                 type="email"
+                 value={email}
+                 onChange={e => setEmail(e.target.value)}
+                 className="w-full p-4 bg-[#F2F2F7] rounded-xl border-none outline-none focus:ring-2 focus:ring-[#007AFF]/20 text-[#1C1C1E] transition-all disabled:opacity-50"
+                 placeholder="Email"
+                 autoFocus
+                 autoComplete="username"
+                 required
+                 disabled={isLoading}
+             />
+             <input
+                 type="password"
+                 value={password}
+                 onChange={e => setPassword(e.target.value)}
+                 className="w-full p-4 bg-[#F2F2F7] rounded-xl border-none outline-none focus:ring-2 focus:ring-[#007AFF]/20 text-[#1C1C1E] transition-all disabled:opacity-50"
+                 placeholder="Password"
+                 autoComplete="current-password"
+                 required
+                 disabled={isLoading}
+             />
             {error && <p className="text-[#FF3B30] text-xs font-medium">{error}</p>}
             <Button fullWidth type="submit" variant="primary" disabled={isLoading}>
                 {isLoading ? <><Loader2 className="animate-spin" size={20}/> Verifying...</> : 'Unlock'}
@@ -643,18 +652,24 @@ const SettingsTab: React.FC = () => {
 // --- Main Admin Layout ---
 
 export const AdminPortal: React.FC = () => {
-  const [isAuthenticated, setIsAuthenticated] = useState(() => {
-      return localStorage.getItem(STORAGE_KEYS.ADMIN_SESSION) === 'true';
-  });
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [authChecked, setAuthChecked] = useState(false);
   const [activeTab, setActiveTab] = useState<'bookings' | 'services' | 'settings'>('bookings');
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const mainRef = useRef<HTMLDivElement>(null);
 
+  useEffect(() => {
+      const unsubscribe = api.onAuthChanged((isAdmin) => {
+          setIsAuthenticated(isAdmin);
+          setAuthChecked(true);
+      });
+      return unsubscribe;
+  }, []);
+
   const handleLogout = () => {
-      localStorage.removeItem(STORAGE_KEYS.ADMIN_SESSION);
-      setIsAuthenticated(false);
+      api.logout().catch(console.error);
   }
-  
+
   useEffect(() => {
       if(mainRef.current) {
           mainRef.current.scrollTo({ top: 0 });
@@ -666,8 +681,16 @@ export const AdminPortal: React.FC = () => {
       setIsSidebarOpen(false);
   };
 
+  if (!authChecked) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-[#F2F2F7]">
+        <Loader2 className="animate-spin text-[#8E8E93]" size={32} />
+      </div>
+    );
+  }
+
   if (!isAuthenticated) {
-    return <AdminLogin onLogin={() => setIsAuthenticated(true)} />;
+    return <AdminLogin />;
   }
 
   return (

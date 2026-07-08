@@ -23,7 +23,6 @@ export const DEFAULT_HOURS: Record<number, WorkingHours> = {
 export const STORAGE_KEYS = {
   BOOKINGS: 'waylins_bookings',
   CONFIG: 'waylins_config',
-  ADMIN_SESSION: 'waylins_admin_session',
 };
 
 // Helper to seed data if empty

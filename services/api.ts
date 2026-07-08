@@ -14,15 +14,25 @@ import { format, parse, addMinutes, areIntervalsOverlapping, getDay } from 'date
 
 // --- FIREBASE IMPORTS ---
 import { initializeApp, getApps, getApp } from 'firebase/app';
-import { 
-  getFirestore, 
-  collection, 
-  doc, 
-  onSnapshot, 
-  setDoc, 
-  updateDoc, 
-  deleteDoc, 
+import {
+  getFirestore,
+  collection,
+  doc,
+  onSnapshot,
+  setDoc,
+  updateDoc,
+  deleteDoc,
 } from 'firebase/firestore';
+import {
+  getAuth,
+  signInWithEmailAndPassword,
+  signOut,
+  onAuthStateChanged,
+  Auth,
+  User,
+} from 'firebase/auth';
+
+const ADMIN_EMAIL = 'qaabilmullah@gmail.com';
 
 // --- CONFIGURATION ---
 const firebaseConfig = {
@@ -36,12 +46,20 @@ const firebaseConfig = {
 
 // Initialize Firebase
 let db: any = null;
+let auth: Auth | null = null;
+let currentUser: User | null = null;
+
+const isAdminUser = (user: User | null) => !!user && user.email === ADMIN_EMAIL;
 
 try {
     // Only initialize if keys are present to avoid errors during setup
     if (firebaseConfig.apiKey) {
         const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
         db = getFirestore(app);
+        auth = getAuth(app);
+        onAuthStateChanged(auth, (user) => {
+            currentUser = user;
+        });
         console.log("✅ Firebase Initialized Successfully");
     } else {
         console.warn("⚠️ Firebase keys are missing in services/api.ts");
@@ -157,8 +175,14 @@ export const api = {
                         blockouts: configCache.blockouts || []
                     };
                 } else {
-                    // Initialize DB if empty
-                    setDoc(configRef, INITIAL_CONFIG).catch(console.error);
+                    // Config doc missing. Only the admin may seed it — the rules
+                    // deny settings writes to everyone else, so a client-side
+                    // write here would fail-loop for normal visitors.
+                    if (isAdminUser(currentUser)) {
+                        setDoc(configRef, INITIAL_CONFIG).catch(console.error);
+                    } else {
+                        configCache = INITIAL_CONFIG;
+                    }
                 }
                 notifyListeners();
             });
@@ -178,8 +202,27 @@ export const api = {
       notifyListeners();
   },
 
-  login: (password: string): boolean => {
-    return password === '1234';
+  login: async (email: string, password: string): Promise<boolean> => {
+    if (!auth) throw new Error("Authentication not available. Check Firebase configuration.");
+    const cred = await signInWithEmailAndPassword(auth, email, password);
+    if (cred.user.email !== ADMIN_EMAIL) {
+        await signOut(auth);
+        return false;
+    }
+    return true;
+  },
+
+  logout: async (): Promise<void> => {
+    if (auth) await signOut(auth);
+  },
+
+  // Subscribe to auth state; callback receives true when the admin is signed in.
+  onAuthChanged: (callback: (isAdmin: boolean) => void): (() => void) => {
+    if (!auth) {
+        callback(false);
+        return () => {};
+    }
+    return onAuthStateChanged(auth, (user) => callback(isAdminUser(user)));
   },
 
   // --- READ OPERATIONS ---
