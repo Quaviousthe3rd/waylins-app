@@ -31,6 +31,7 @@ import {
   Auth,
   User,
 } from 'firebase/auth';
+import { getFunctions, httpsCallable } from 'firebase/functions';
 
 const ADMIN_EMAIL = 'qaabilmullah@gmail.com';
 
@@ -48,6 +49,7 @@ const firebaseConfig = {
 let db: any = null;
 let auth: Auth | null = null;
 let currentUser: User | null = null;
+let firebaseApp: any = null;
 
 const isAdminUser = (user: User | null) => !!user && user.email === ADMIN_EMAIL;
 
@@ -55,6 +57,7 @@ try {
     // Only initialize if keys are present to avoid errors during setup
     if (firebaseConfig.apiKey) {
         const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
+        firebaseApp = app;
         db = getFirestore(app);
         auth = getAuth(app);
         onAuthStateChanged(auth, (user) => {
@@ -124,9 +127,44 @@ const sendTelegramNotification = async (message: string) => {
     }
 };
 
+// --- PAYMENT ENVIRONMENT ---
+// Which Paystack environment is active, decided server-side in
+// settings/paymentConfig. The public key comes from the server too, so
+// switching modes never requires a client rebuild. On any failure we fall
+// back to live-with-no-key: the UI then uses the env var it always used,
+// so the live path behaves exactly as before this feature existed.
+export interface PaymentEnv {
+    mode: 'test' | 'live';
+    publicKey: string | null;
+}
+
+let paymentEnvPromise: Promise<PaymentEnv> | null = null;
+
+const fetchPaymentEnv = async (): Promise<PaymentEnv> => {
+    if (!firebaseApp) return { mode: 'live', publicKey: null };
+    try {
+        const functions = getFunctions(firebaseApp, 'europe-west1');
+        const call = httpsCallable(functions, 'getPaymentMode');
+        const result: any = await call();
+        const mode = result?.data?.mode === 'test' ? 'test' : 'live';
+        const publicKey = typeof result?.data?.publicKey === 'string' && result.data.publicKey.startsWith('pk_')
+            ? result.data.publicKey
+            : null;
+        return { mode, publicKey };
+    } catch (e) {
+        console.error('getPaymentMode failed; defaulting to live.', e);
+        return { mode: 'live', publicKey: null };
+    }
+};
+
 // --- API IMPLEMENTATION ---
 
 export const api = {
+  getPaymentEnv: (): Promise<PaymentEnv> => {
+      if (!paymentEnvPromise) paymentEnvPromise = fetchPaymentEnv();
+      return paymentEnvPromise;
+  },
+
   // Initialize Real-time Listeners
   subscribe: (listener: () => void) => {
     listeners.push(listener);

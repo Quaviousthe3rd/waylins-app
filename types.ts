@@ -46,6 +46,7 @@ export interface Booking {
   createdAt: string;
   paymentReference?: string; // Paystack transaction reference
   transactionId?: string; // Paystack transaction ID
+  mode?: 'test' | 'live'; // Paystack environment; 'test' rows are excluded from revenue totals
 }
 
 export interface WorkingHours {

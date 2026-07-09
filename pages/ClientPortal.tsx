@@ -3,7 +3,7 @@ import { PaystackButton } from 'react-paystack';
 import { Link } from 'react-router-dom';
 import { v4 as uuidv4 } from 'uuid';
 import { User, Calendar, Scissors, CreditCard, CheckCircle, Clock, ArrowLeft, LogOut, ChevronRight, ChevronLeft, Check, AlertCircle, RotateCcw } from 'lucide-react';
-import { api } from '../services/api';
+import { api, PaymentEnv } from '../services/api';
 import { Client, ServiceItem, Booking, PaymentMethod, PaymentStatus, BookingStatus, Blockout } from '../types';
 import { format, addDays, startOfToday, getDay } from 'date-fns';
 import { Button } from '../components/ui/Button';
@@ -141,6 +141,14 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
   
   const dateScrollRef = useRef<HTMLDivElement>(null);
   const [apiTick, setApiTick] = useState(0);
+  // Server-decided Paystack environment (test/live) + matching public key.
+  const [paymentEnv, setPaymentEnv] = useState<PaymentEnv | null>(null);
+
+  useEffect(() => {
+    let mounted = true;
+    api.getPaymentEnv().then(env => { if (mounted) setPaymentEnv(env); });
+    return () => { mounted = false; };
+  }, []);
 
   useEffect(() => {
     const unsubscribe = api.subscribe(() => {
@@ -262,7 +270,10 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
         paymentMethod: paymentMethod,
         paymentStatus: paymentStatus,
         paymentReference: response.reference,
-        transactionId: response.transaction || response.trxref
+        transactionId: response.transaction || response.trxref,
+        // Test-mode bookings are stamped so they can be excluded from any
+        // revenue/statement totals.
+        mode: paymentEnv?.mode ?? 'live'
       }, rescheduleBooking?.id);
 
       // Async Cancel old booking if rescheduling
@@ -325,6 +336,17 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
   const paystackSubaccount = rawSubaccount && rawSubaccount.startsWith('ACCT_')
     ? rawSubaccount
     : rawSubaccount || undefined;
+
+  // Which public key mounts checkout. In test mode ONLY the server-provided
+  // pk_test_ key is acceptable — never fall back to the live env var. In
+  // live mode the server key wins, with the env var as the pre-existing
+  // fallback so live behavior is unchanged.
+  const isTestMode = paymentEnv?.mode === 'test';
+  const paystackPublicKey: string | undefined = paymentEnv === null
+    ? undefined
+    : isTestMode
+      ? (paymentEnv.publicKey ?? undefined)
+      : (paymentEnv.publicKey ?? import.meta.env.VITE_PAYSTACK_PUBLIC_KEY ?? undefined);
 
 
   // Main handleBook - no longer used for online flow as PaystackButton handles it
@@ -594,13 +616,23 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
                  {/* Paystack Payment Button - Only show when online payment is selected */}
                  {paymentMethod === PaymentMethod.ONLINE && selectedService && selectedDate && selectedSlot && depositOption && (
                     <div className="mt-6">
-                        {!import.meta.env.VITE_PAYSTACK_PUBLIC_KEY ? (
+                        {paymentEnv === null ? (
+                            <div className="p-4 bg-[#F2F2F7] text-[#8E8E93] rounded-2xl flex items-center gap-3 text-sm font-medium">
+                                <Clock size={20} />
+                                Loading secure payment...
+                            </div>
+                        ) : !paystackPublicKey ? (
                             <div className="p-4 bg-[#FF9500]/10 text-[#FF9500] rounded-2xl flex items-center gap-3 text-sm font-medium">
                                 <AlertCircle size={20} />
                                 Payment system is currently unavailable. Please try again later.
                             </div>
                         ) : (
                             <div className="space-y-3">
+                                {isTestMode && (
+                                    <div className="p-3 bg-[#FF9500]/10 text-[#FF9500] rounded-xl text-sm font-bold uppercase tracking-wide text-center">
+                                        Test mode — no real money will be charged
+                                    </div>
+                                )}
                                 {paymentMethod === PaymentMethod.ONLINE && rawSplitCode && !rawSplitCode.startsWith('SPL_') && (
                                     <div className="p-3 bg-[#FF3B30]/10 text-[#FF3B30] rounded-xl text-sm font-medium">
                                         <AlertCircle size={16} className="inline mr-2" />
@@ -621,16 +653,17 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
                                         return (
                                             <>
                                             <PaystackButton
-                                                publicKey={import.meta.env.VITE_PAYSTACK_PUBLIC_KEY}
+                                                publicKey={paystackPublicKey}
                                                 email={paystackEmail} // synthesized from phone to satisfy email format
                                                 amount={Math.round(deposit * 100)} // cents
                                                 currency="ZAR"
                                                 reference={`WAYLINS-${Date.now()}-${uuidv4().substring(0, 8)}`}
-                                                metadata={{ phone: phoneDigits } as any}
-                                                split_code={!paystackSubaccount ? paystackSplitCode || undefined : undefined}
-                                                subaccount={paystackSubaccount || undefined}
-                                                transaction_charge={paystackSubaccount ? Math.round(creatorShareForTransaction * 100) : undefined}
-                                                bearer={paystackSubaccount ? "subaccount" : undefined}
+                                                metadata={{ phone: phoneDigits, mode: paymentEnv?.mode } as any}
+                                                // Test mode has no real subaccount: never send split params there.
+                                                split_code={!isTestMode && !paystackSubaccount ? paystackSplitCode || undefined : undefined}
+                                                subaccount={!isTestMode ? paystackSubaccount || undefined : undefined}
+                                                transaction_charge={!isTestMode && paystackSubaccount ? Math.round(creatorShareForTransaction * 100) : undefined}
+                                                bearer={!isTestMode && paystackSubaccount ? "subaccount" : undefined}
                                                 text={
                                                   isProcessingPayment
                                                     ? "Processing..."

@@ -14,10 +14,22 @@ const db = getFirestore();
 const TELEGRAM_BOT_TOKEN = defineSecret("TELEGRAM_BOT_TOKEN");
 const TELEGRAM_CHAT_ID = defineSecret("TELEGRAM_CHAT_ID");
 const PAYSTACK_SECRET_KEY = defineSecret("PAYSTACK_SECRET_KEY");
+const PAYSTACK_SECRET_KEY_TEST = defineSecret("PAYSTACK_SECRET_KEY_TEST");
+
+// --- Payment mode ---
+// settings/paymentConfig.mode switches the ENTIRE money path between
+// Paystack live and test integrations. Anything other than the literal
+// string "test" (including a missing field) means LIVE — the live path is
+// the default and is never altered by test-mode logic.
+type PaymentMode = "test" | "live";
+const paymentModeOf = (payCfg: any): PaymentMode =>
+  payCfg?.mode === "test" ? "test" : "live";
+const secretKeyFor = (mode: PaymentMode): string =>
+  mode === "test" ? PAYSTACK_SECRET_KEY_TEST.value() : PAYSTACK_SECRET_KEY.value();
 
 // Healthcheck: verifies the deploy pipeline end-to-end before any money logic.
 export const ping = onRequest(
-  { secrets: [TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, PAYSTACK_SECRET_KEY] },
+  { secrets: [TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, PAYSTACK_SECRET_KEY, PAYSTACK_SECRET_KEY_TEST] },
   (_req, res) => {
     res.json({ ok: true, time: new Date().toISOString() });
   }
@@ -114,7 +126,7 @@ const makeReference = (): string => {
 };
 
 export const initTransaction = onCall(
-  { secrets: [PAYSTACK_SECRET_KEY] },
+  { secrets: [PAYSTACK_SECRET_KEY, PAYSTACK_SECRET_KEY_TEST] },
   async (request) => {
     const { serviceId, date, timeSlot, clientName, clientPhone } =
       request.data ?? {};
@@ -209,8 +221,11 @@ export const initTransaction = onCall(
 
     // 4. Payment routing config (server-only doc; clients can't read it).
     const paySnap = await db.doc("settings/paymentConfig").get();
+    const mode = paymentModeOf(paySnap.data());
+    // Test mode has no real subaccount: skip the split entirely. In live
+    // mode the subaccount is mandatory — unchanged.
     const subaccountCode: string | undefined = paySnap.data()?.subaccountCode;
-    if (!subaccountCode || !subaccountCode.startsWith("ACCT_")) {
+    if (mode === "live" && (!subaccountCode || !subaccountCode.startsWith("ACCT_"))) {
       throw new HttpsError(
         "failed-precondition",
         "Online payment is not configured. Please choose pay in person."
@@ -228,6 +243,7 @@ export const initTransaction = onCall(
     const reference = makeReference();
     await db.doc(`pendingPayments/${reference}`).set({
       reference,
+      mode,
       status: "initialized",
       booking: {
         clientName: clientName.trim(),
@@ -254,10 +270,12 @@ export const initTransaction = onCall(
 
     // 7. Initialize the Paystack transaction. NOTE: subaccount split with a
     //    flat transaction_charge; SPL_ split codes are deliberately not used.
+    //    In test mode the split params are omitted (no real subaccount) and
+    //    the test secret key is used; everything else is identical.
     const resp = await fetch("https://api.paystack.co/transaction/initialize", {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${PAYSTACK_SECRET_KEY.value()}`,
+        Authorization: `Bearer ${secretKeyFor(mode)}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
@@ -265,10 +283,15 @@ export const initTransaction = onCall(
         currency: "ZAR",
         email: "bookings@waylins-37532.web.app",
         reference,
-        subaccount: subaccountCode,
-        transaction_charge: quote.transactionChargeCents,
-        bearer: "account",
+        ...(mode === "live"
+          ? {
+              subaccount: subaccountCode,
+              transaction_charge: quote.transactionChargeCents,
+              bearer: "account",
+            }
+          : {}),
         metadata: {
+          mode,
           reference,
           clientName: clientName.trim(),
           clientPhone: clientPhone.trim(),
@@ -328,6 +351,19 @@ export const quoteService = onCall(async (request) => {
   };
 });
 
+// Public, non-sensitive payment environment for the client UI: which mode
+// is active and which Paystack PUBLIC key to mount checkout with. Public
+// keys live in settings/paymentConfig as publicKeyLive / publicKeyTest.
+// Never returns secrets or the subaccount code.
+export const getPaymentMode = onCall(async () => {
+  const payCfg = (await db.doc("settings/paymentConfig").get()).data();
+  const mode = paymentModeOf(payCfg);
+  const raw = mode === "test" ? payCfg?.publicKeyTest : payCfg?.publicKeyLive;
+  const publicKey =
+    typeof raw === "string" && raw.trim().startsWith("pk_") ? raw.trim() : null;
+  return { mode, publicKey };
+});
+
 // --- Telegram (server-side, NEW bot) ---
 // Sent only AFTER Firestore writes commit; a Telegram failure is logged and
 // never fails the webhook response.
@@ -365,24 +401,44 @@ const escapeHTML = (s: string): string =>
 // reference: ledger/{reference} is created exactly once via tx.create(),
 // which throws ALREADY_EXISTS on Paystack's retries.
 export const paystackWebhook = onRequest(
-  { secrets: [PAYSTACK_SECRET_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID] },
+  {
+    secrets: [
+      PAYSTACK_SECRET_KEY,
+      PAYSTACK_SECRET_KEY_TEST,
+      TELEGRAM_BOT_TOKEN,
+      TELEGRAM_CHAT_ID,
+    ],
+  },
   async (req, res) => {
     // 1. Signature check — 401 and write nothing on any failure.
+    //    Live and test integrations sign with different secret keys; which
+    //    key verifies tells us which environment the event came from
+    //    (eventMode). Same algorithm, same timing-safe comparison for both.
     const signature = req.headers["x-paystack-signature"];
     const rawBody: Buffer | undefined = (req as any).rawBody;
     if (typeof signature !== "string" || !signature || !rawBody) {
       res.status(401).send("unauthorized");
       return;
     }
-    const expected = createHmac("sha512", PAYSTACK_SECRET_KEY.value())
-      .update(rawBody)
-      .digest("hex");
     const sigBuf = Buffer.from(signature, "utf8");
-    const expBuf = Buffer.from(expected, "utf8");
-    if (sigBuf.length !== expBuf.length || !timingSafeEqual(sigBuf, expBuf)) {
+    const verifiesWith = (key: string): boolean => {
+      const expBuf = Buffer.from(
+        createHmac("sha512", key).update(rawBody).digest("hex"),
+        "utf8"
+      );
+      return sigBuf.length === expBuf.length && timingSafeEqual(sigBuf, expBuf);
+    };
+    const eventMode: PaymentMode | null = verifiesWith(PAYSTACK_SECRET_KEY.value())
+      ? "live"
+      : verifiesWith(PAYSTACK_SECRET_KEY_TEST.value())
+        ? "test"
+        : null;
+    if (!eventMode) {
       res.status(401).send("unauthorized");
       return;
     }
+    // Test events are visibly tagged everywhere they surface.
+    const tag = eventMode === "test" ? "[TEST] " : "";
 
     let event: any;
     try {
@@ -412,9 +468,11 @@ export const paystackWebhook = onRequest(
       data.fees != null ? randFromCents(Number(data.fees) || 0) : null;
 
     // Base ledger fields shared by every outcome. The raw event is stored
-    // verbatim for reconciliation.
+    // verbatim for reconciliation. `mode` is stamped on EVERY row: rows with
+    // mode "test" must be excluded from all revenue/statement totals.
     const ledgerBase = {
       reference,
+      mode: eventMode,
       transactionId: data.id != null ? String(data.id) : null,
       charged: randFromCents(chargedCents),
       paystackFeeActual: paystackFeeActualRand,
@@ -441,13 +499,41 @@ export const paystackWebhook = onRequest(
         throw e;
       }
       await sendTelegram(
-        `⚠️ <b>Unmatched Paystack payment</b>\nReference: <code>${escapeHTML(reference)}</code>\nAmount: R${randFromCents(chargedCents)}\nNo pending booking found — investigate in the Paystack dashboard.`
+        `${tag}⚠️ <b>Unmatched Paystack payment</b>\nReference: <code>${escapeHTML(reference)}</code>\nAmount: R${randFromCents(chargedCents)}\nNo pending booking found — investigate in the Paystack dashboard.`
       );
       res.status(200).send("ok");
       return;
     }
 
     const pending = pendingSnap.data() as any;
+
+    // 4b. Cross-mode guard: an event may only settle an intent created in
+    //     the SAME environment. A test-signed charge (free test cards) must
+    //     never confirm a live booking intent — that would be a payment
+    //     bypass. Record, alert, ack; never book.
+    const intentMode: PaymentMode = pending.mode === "test" ? "test" : "live";
+    if (intentMode !== eventMode) {
+      console.error(
+        `MODE_MISMATCH ${reference}: event is ${eventMode}, intent is ${intentMode}`
+      );
+      try {
+        await ledgerRef.create({
+          ...ledgerBase,
+          bookingId: null,
+          status: "MODE_MISMATCH",
+          intentMode,
+        });
+      } catch (e: any) {
+        if (e?.code === 6) { res.status(200).send("ok"); return; }
+        throw e;
+      }
+      await sendTelegram(
+        `${tag}🚨 <b>Paystack mode mismatch</b>\nReference: <code>${escapeHTML(reference)}</code>\nEvent env: ${eventMode} — booking intent env: ${intentMode}\nNo booking was created. Investigate immediately.`
+      );
+      res.status(200).send("ok");
+      return;
+    }
+
     const b = pending.booking ?? {};
     const amounts = pending.amounts ?? {};
     const bookingFields = {
@@ -475,7 +561,7 @@ export const paystackWebhook = onRequest(
         throw e;
       }
       await sendTelegram(
-        `⚠️ <b>Paystack amount mismatch</b>\nReference: <code>${escapeHTML(reference)}</code>\nCharged: R${randFromCents(chargedCents)} — expected R${randFromCents(Number(amounts.amountCents) || 0)}\nClient: ${escapeHTML(bookingFields.clientName)}\nNo booking was created. Review and refund/adjust manually.`
+        `${tag}⚠️ <b>Paystack amount mismatch</b>\nReference: <code>${escapeHTML(reference)}</code>\nCharged: R${randFromCents(chargedCents)} — expected R${randFromCents(Number(amounts.amountCents) || 0)}\nClient: ${escapeHTML(bookingFields.clientName)}\nNo booking was created. Review and refund/adjust manually.`
       );
       res.status(200).send("ok");
       return;
@@ -521,6 +607,9 @@ export const paystackWebhook = onRequest(
           });
           tx.set(bookingRef, {
             id: bookingRef.id,
+            // Test bookings are stamped so they can be filtered out of any
+            // revenue/statement totals alongside their ledger rows.
+            mode: eventMode,
             clientName: bookingFields.clientName,
             clientPhone: String(b.clientPhone ?? ""),
             date: bookingFields.date,
@@ -554,11 +643,11 @@ export const paystackWebhook = onRequest(
     // 7. Telegram AFTER the writes; failure is logged only.
     if (slotTaken) {
       await sendTelegram(
-        `🔴 <b>Paid but slot taken — refund needed</b>\nClient: ${escapeHTML(bookingFields.clientName)} (${escapeHTML(String(b.clientPhone ?? ""))})\nService: ${escapeHTML(bookingFields.serviceName)}\n${escapeHTML(bookingFields.date)} at ${escapeHTML(bookingFields.timeSlot)}\nPaid: R${randFromCents(chargedCents)}\nReference: <code>${escapeHTML(reference)}</code>\nRefund manually in the Paystack dashboard.`
+        `${tag}🔴 <b>Paid but slot taken — refund needed</b>\nClient: ${escapeHTML(bookingFields.clientName)} (${escapeHTML(String(b.clientPhone ?? ""))})\nService: ${escapeHTML(bookingFields.serviceName)}\n${escapeHTML(bookingFields.date)} at ${escapeHTML(bookingFields.timeSlot)}\nPaid: R${randFromCents(chargedCents)}\nReference: <code>${escapeHTML(reference)}</code>\nRefund manually in the Paystack dashboard.`
       );
     } else {
       await sendTelegram(
-        `✅ <b>New paid booking</b>\nClient: ${escapeHTML(bookingFields.clientName)} (${escapeHTML(String(b.clientPhone ?? ""))})\nService: ${escapeHTML(bookingFields.serviceName)}\nWhen: ${escapeHTML(bookingFields.date)} at ${escapeHTML(bookingFields.timeSlot)}\nAmount: R${randFromCents(chargedCents)}\nRef: <code>${escapeHTML(reference)}</code>`
+        `${tag}✅ <b>New paid booking</b>\nClient: ${escapeHTML(bookingFields.clientName)} (${escapeHTML(String(b.clientPhone ?? ""))})\nService: ${escapeHTML(bookingFields.serviceName)}\nWhen: ${escapeHTML(bookingFields.date)} at ${escapeHTML(bookingFields.timeSlot)}\nAmount: R${randFromCents(chargedCents)}\nRef: <code>${escapeHTML(reference)}</code>`
       );
     }
     res.status(200).send("ok");
