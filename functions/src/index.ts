@@ -319,7 +319,11 @@ export const initTransaction = onCall(
       .doc(`pendingPayments/${reference}`)
       .set({ status: "awaiting_payment", accessCode: body.data.access_code ?? null }, { merge: true });
 
-    return { reference, authorization_url: body.data.authorization_url };
+    return {
+      reference,
+      access_code: body.data.access_code ?? null,
+      authorization_url: body.data.authorization_url,
+    };
   }
 );
 

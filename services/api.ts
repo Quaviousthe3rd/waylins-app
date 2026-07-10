@@ -22,6 +22,8 @@ import {
   setDoc,
   updateDoc,
   deleteDoc,
+  query,
+  where,
 } from 'firebase/firestore';
 import {
   getAuth,
@@ -140,6 +142,23 @@ export interface PaymentEnv {
 
 let paymentEnvPromise: Promise<PaymentEnv> | null = null;
 
+// Server-computed quote for a service. The server (quoteService) is the
+// single source of truth for pricing — the client never computes amounts.
+export interface ServiceQuote {
+    base: number;
+    serviceFee: number;
+    total: number;
+}
+
+// Result of initTransaction: the server-created Paystack transaction the
+// client resumes (popup) or is redirected to. This is the ONE transaction
+// being paid; the client never initializes its own.
+export interface InitTransactionResult {
+    reference: string;
+    access_code: string | null;
+    authorization_url: string;
+}
+
 const fetchPaymentEnv = async (): Promise<PaymentEnv> => {
     if (!firebaseApp) return { mode: 'live', publicKey: null };
     try {
@@ -163,6 +182,66 @@ export const api = {
   getPaymentEnv: (): Promise<PaymentEnv> => {
       if (!paymentEnvPromise) paymentEnvPromise = fetchPaymentEnv();
       return paymentEnvPromise;
+  },
+
+  // Server-side quote for the booking wizard's price display.
+  getQuote: async (serviceId: string): Promise<ServiceQuote> => {
+      if (!firebaseApp) throw new Error('Database not connected.');
+      const functions = getFunctions(firebaseApp, 'europe-west1');
+      const call = httpsCallable(functions, 'quoteService');
+      const result: any = await call({ serviceId });
+      return {
+          base: Number(result?.data?.base),
+          serviceFee: Number(result?.data?.serviceFee),
+          total: Number(result?.data?.total),
+      };
+  },
+
+  // Create the payment intent + Paystack transaction server-side.
+  initTransaction: async (payload: {
+      serviceId: string;
+      date: string;
+      timeSlot: string;
+      clientName: string;
+      clientPhone: string;
+  }): Promise<InitTransactionResult> => {
+      if (!firebaseApp) throw new Error('Database not connected.');
+      const functions = getFunctions(firebaseApp, 'europe-west1');
+      const call = httpsCallable(functions, 'initTransaction');
+      const result: any = await call(payload);
+      return {
+          reference: String(result?.data?.reference),
+          access_code: result?.data?.access_code ?? null,
+          authorization_url: String(result?.data?.authorization_url),
+      };
+  },
+
+  // Wait for the webhook-created booking to appear (paymentReference match).
+  // Resolves with the booking, or null after timeoutMs. Read-only: the
+  // client NEVER writes the booking — the paystackWebhook function does.
+  waitForBookingByReference: (reference: string, timeoutMs: number): Promise<Booking | null> => {
+      if (!db) return Promise.resolve(null);
+      return new Promise((resolve) => {
+          const q = query(collection(db, 'bookings'), where('paymentReference', '==', reference));
+          let done = false;
+          const finish = (b: Booking | null) => {
+              if (done) return;
+              done = true;
+              clearTimeout(timer);
+              unsubscribe();
+              resolve(b);
+          };
+          const timer = setTimeout(() => finish(null), timeoutMs);
+          const unsubscribe = onSnapshot(q, (snapshot) => {
+              if (!snapshot.empty) {
+                  const d = snapshot.docs[0];
+                  finish({ id: d.id, ...d.data() } as Booking);
+              }
+          }, (error) => {
+              console.error('Booking confirmation listener failed:', error);
+              finish(null);
+          });
+      });
   },
 
   // Initialize Real-time Listeners

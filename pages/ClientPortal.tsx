@@ -1,9 +1,9 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { PaystackButton } from 'react-paystack';
+// @ts-ignore - @paystack/inline-js ships without type declarations
+import PaystackPop from '@paystack/inline-js';
 import { Link } from 'react-router-dom';
-import { v4 as uuidv4 } from 'uuid';
 import { User, Calendar, Scissors, CreditCard, CheckCircle, Clock, ArrowLeft, LogOut, ChevronRight, ChevronLeft, Check, AlertCircle, RotateCcw } from 'lucide-react';
-import { api, PaymentEnv } from '../services/api';
+import { api, PaymentEnv, ServiceQuote } from '../services/api';
 import { Client, ServiceItem, Booking, PaymentMethod, PaymentStatus, BookingStatus, Blockout } from '../types';
 import { format, addDays, startOfToday, getDay } from 'date-fns';
 import { Button } from '../components/ui/Button';
@@ -132,12 +132,17 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
   const [selectedSlot, setSelectedSlot] = useState<string>('');
   const [selectedService, setSelectedService] = useState<ServiceItem | null>(preselectedService || null);
   const [paymentMethod, setPaymentMethod] = useState<PaymentMethod | null>(null);
-  const [depositOption, setDepositOption] = useState<'full' | 'deposit' | null>(null);
   const [availableSlots, setAvailableSlots] = useState<string[]>([]);
   const [finalBooking, setFinalBooking] = useState<Booking | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(globalError || null);
   const [isProcessingPayment, setIsProcessingPayment] = useState(false);
+  // Server-quoted pricing — the ONLY source of amounts shown in the wizard.
+  const [quote, setQuote] = useState<ServiceQuote | null>(null);
+  // Payment made; waiting for the webhook-created booking to appear.
+  const [isConfirming, setIsConfirming] = useState(false);
+  // Payment made but no booking appeared within the timeout.
+  const [pendingReference, setPendingReference] = useState<string | null>(null);
   
   const dateScrollRef = useRef<HTMLDivElement>(null);
   const [apiTick, setApiTick] = useState(0);
@@ -233,79 +238,51 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
     if (!paymentMethod) {
       setPaymentMethod(PaymentMethod.ONLINE);
     }
-    if (!depositOption) {
-      setDepositOption('full');
-    }
-  }, [paymentMethod, depositOption]);
+  }, [paymentMethod]);
 
-  // Handle online payment - create booking after successful payment
-  const handlePaymentSuccess = async (response: any) => {
-    if (!selectedService || !selectedDate || !selectedSlot || !paymentMethod || !depositOption) return;
-    
-    setIsProcessingPayment(true);
+  // Server quote for the selected service — the wizard never computes prices.
+  useEffect(() => {
+    setQuote(null);
+    if (!selectedService) return;
+    let mounted = true;
+    api.getQuote(selectedService.id)
+      .then(q => { if (mounted) setQuote(q); })
+      .catch(e => {
+        console.error('quoteService failed', e);
+        if (mounted) setError('Could not load pricing. Please try again.');
+      });
+    return () => { mounted = false; };
+  }, [selectedService]);
+
+  const isTestMode = paymentEnv?.mode === 'test';
+
+  // Payment succeeded on the server-created transaction. The webhook writes
+  // the booking; we only WAIT for it to appear (no client-side write, ever).
+  const handlePaymentSuccess = async (reference: string) => {
+    setIsProcessingPayment(false);
+    setIsConfirming(true);
     setError(null);
-    
     try {
-      const basePrice = selectedService.price;
-      const serviceFee = 50;
-      const total = basePrice + serviceFee;
-      const deposit = depositOption === 'deposit' ? total / 2 : total;
-      
-      // Determine payment status based on deposit amount
-      const paymentStatus = depositOption === 'deposit' 
-        ? PaymentStatus.PARTIALLY_PAID
-        : PaymentStatus.PAID;
-      
-      // Create booking with payment details after successful payment
-      const booking = await api.createBooking({
-        clientName: client.name,
-        clientPhone: client.phone,
-        date: selectedDate,
-        timeSlot: selectedSlot,
-        serviceId: selectedService.id,
-        serviceName: selectedService.name,
-        durationMinutes: selectedService.durationMinutes,
-        amount: total,
-        depositAmount: deposit,
-        paymentMethod: paymentMethod,
-        paymentStatus: paymentStatus,
-        paymentReference: response.reference,
-        transactionId: response.transaction || response.trxref,
-        // Test-mode bookings are stamped so they can be excluded from any
-        // revenue/statement totals.
-        mode: paymentEnv?.mode ?? 'live'
-      }, rescheduleBooking?.id);
-
-      // Async Cancel old booking if rescheduling
-      if (rescheduleBooking) {
-        try {
+      const booking = await api.waitForBookingByReference(reference, 60_000);
+      if (booking) {
+        // Best-effort cancel of the old booking when rescheduling.
+        if (rescheduleBooking) {
+          try {
             await api.updateBooking(rescheduleBooking.id, { status: BookingStatus.CANCELLED });
-        } catch (e) {
-            console.warn("Could not auto-cancel old booking during reschedule", e);
+          } catch (e) {
+            console.warn('Could not auto-cancel old booking during reschedule', e);
+          }
         }
+        setFinalBooking(booking);
+        setStep(5);
+        notify.success('Booking confirmed! Payment successful.');
+      } else {
+        setPendingReference(reference);
       }
-      
-      setFinalBooking(booking);
-      setStep(5);
-      const paymentMessage = depositOption === 'deposit' 
-        ? 'Booking confirmed! 50% deposit paid successfully.'
-        : 'Booking confirmed! Full payment successful.';
-      notify.success(paymentMessage);
-    } catch (e: any) {
-      api.refresh(); 
-      
-      // Payment succeeded but booking creation failed - critical error
-      const errorMessage = e?.message?.includes('Database not connected')
-        ? 'Payment received but we could not save your booking. Do NOT pay again. Contact the shop with this reference: ' + (response?.reference ?? 'unknown')
-        : 'Payment received but booking failed. Do NOT pay again. Contact the shop with this reference: ' + (response?.reference ?? 'unknown');
-      setError(errorMessage);
-      notify.error(errorMessage);
     } finally {
-      setIsProcessingPayment(false);
+      setIsConfirming(false);
     }
   };
-
-
 
   const handlePaymentClose = () => {
     const message = "Payment was cancelled. Please try again to complete your booking.";
@@ -314,44 +291,42 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
     notify.warning(message);
   };
 
-  const handlePaymentError = (error: any) => {
-    console.error("Payment error:", error);
-    const message = "Payment failed. Please try again or use a different card.";
-    setError(message);
-    setIsProcessingPayment(false);
-    notify.error(message);
-  };
-
-  // Paystack requires an email; synthesize from phone digits (no user email input).
-  const phoneDigits = client.phone.replace(/\D/g, '') || '0000000000';
-  const paystackEmail = `${phoneDigits}@example.com`; // still phone-based, satisfies email format
-  
-  // Get and validate split code or subaccount
-  const rawSplitCode = import.meta.env.VITE_PAYSTACK_SPLIT_CODE?.trim();
-  const paystackSplitCode = rawSplitCode && rawSplitCode.startsWith('SPL_') 
-    ? rawSplitCode 
-    : rawSplitCode || undefined;
-
-  const rawSubaccount = import.meta.env.VITE_PAYSTACK_SUBACCOUNT?.trim();
-  const paystackSubaccount = rawSubaccount && rawSubaccount.startsWith('ACCT_')
-    ? rawSubaccount
-    : rawSubaccount || undefined;
-
-  // Which public key mounts checkout. In test mode ONLY the server-provided
-  // pk_test_ key is acceptable — never fall back to the live env var. In
-  // live mode the server key wins, with the env var as the pre-existing
-  // fallback so live behavior is unchanged.
-  const isTestMode = paymentEnv?.mode === 'test';
-  const paystackPublicKey: string | undefined = paymentEnv === null
-    ? undefined
-    : isTestMode
-      ? (paymentEnv.publicKey ?? undefined)
-      : (paymentEnv.publicKey ?? import.meta.env.VITE_PAYSTACK_PUBLIC_KEY ?? undefined);
-
-
-  // Main handleBook - no longer used for online flow as PaystackButton handles it
-  const handleBook = () => {
-    if (!selectedService || !selectedDate || !selectedSlot || !paymentMethod || !depositOption) return;
+  // The ONE payment path: initTransaction creates the transaction server-side
+  // (server-computed amount, server reference); the popup only resumes it.
+  const handlePay = async () => {
+    if (!selectedService || !selectedDate || !selectedSlot || isProcessingPayment) return;
+    setIsProcessingPayment(true);
+    setError(null);
+    try {
+      const init = await api.initTransaction({
+        serviceId: selectedService.id,
+        date: selectedDate,
+        timeSlot: selectedSlot,
+        clientName: client.name,
+        clientPhone: client.phone,
+      });
+      if (init.access_code) {
+        const popup = new PaystackPop();
+        popup.resumeTransaction(init.access_code, {
+          onSuccess: () => handlePaymentSuccess(init.reference),
+          onCancel: handlePaymentClose,
+          onError: (e: any) => {
+            console.error('Paystack popup error', e);
+            setError('Payment failed. Please try again or use a different card.');
+            setIsProcessingPayment(false);
+            notify.error('Payment failed. Please try again.');
+          },
+        });
+      } else {
+        // Popup resume unavailable: pay on Paystack's hosted page instead.
+        window.location.href = init.authorization_url;
+      }
+    } catch (e: any) {
+      console.error('initTransaction failed', e);
+      setError(e?.message || 'Could not start the payment. Please try again.');
+      setIsProcessingPayment(false);
+      api.refresh();
+    }
   };
 
   // Success Screen
@@ -581,17 +556,23 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
                  <Card className="p-6 bg-gradient-to-br from-[#1C1C1E] to-[#2C2C2E] text-white border-none shadow-xl relative overflow-hidden">
                     <div className="relative z-10">
                         <div className="text-white/60 text-xs font-bold uppercase tracking-widest mb-1">Total to Pay</div>
-                        <div className="text-4xl font-bold tracking-tight">R{selectedService.price + 50}</div>
-                        <div className="mt-4 flex flex-col gap-1 text-sm text-white/80">
-                            <div className="flex justify-between">
-                                <span>{selectedService.name}</span>
-                                <span>R{selectedService.price}</span>
-                            </div>
-                            <div className="flex justify-between">
-                                <span>Service Fee</span>
-                                <span>R50</span>
-                            </div>
-                        </div>
+                        {quote === null ? (
+                            <div className="text-2xl font-semibold tracking-tight text-white/60 animate-pulse">Loading price…</div>
+                        ) : (
+                            <>
+                                <div className="text-4xl font-bold tracking-tight">R{quote.total}</div>
+                                <div className="mt-4 flex flex-col gap-1 text-sm text-white/80">
+                                    <div className="flex justify-between">
+                                        <span>{selectedService.name}</span>
+                                        <span>R{quote.base}</span>
+                                    </div>
+                                    <div className="flex justify-between">
+                                        <span>Service Fee</span>
+                                        <span>R{quote.serviceFee}</span>
+                                    </div>
+                                </div>
+                            </>
+                        )}
                     </div>
                  </Card>
 
@@ -613,18 +594,22 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
                     </div>
                  </div>
 
-                 {/* Paystack Payment Button - Only show when online payment is selected */}
-                 {paymentMethod === PaymentMethod.ONLINE && selectedService && selectedDate && selectedSlot && depositOption && (
+                 {/* Pay button — the server (initTransaction) owns amount and reference. */}
+                 {paymentMethod === PaymentMethod.ONLINE && selectedService && selectedDate && selectedSlot && (
                     <div className="mt-6">
-                        {paymentEnv === null ? (
-                            <div className="p-4 bg-[#F2F2F7] text-[#8E8E93] rounded-2xl flex items-center gap-3 text-sm font-medium">
-                                <Clock size={20} />
-                                Loading secure payment...
+                        {pendingReference ? (
+                            <div className="p-4 bg-[#FF9500]/10 text-[#FF9500] rounded-2xl flex items-start gap-3 text-sm font-medium">
+                                <AlertCircle size={20} className="shrink-0 mt-0.5" />
+                                <div>
+                                    Payment received — confirmation is taking longer than expected.
+                                    Do NOT pay again. Your booking will appear shortly; if it doesn't,
+                                    contact the shop with this reference: <strong>{pendingReference}</strong>
+                                </div>
                             </div>
-                        ) : !paystackPublicKey ? (
-                            <div className="p-4 bg-[#FF9500]/10 text-[#FF9500] rounded-2xl flex items-center gap-3 text-sm font-medium">
-                                <AlertCircle size={20} />
-                                Payment system is currently unavailable. Please try again later.
+                        ) : isConfirming ? (
+                            <div className="p-4 bg-[#F2F2F7] text-[#8E8E93] rounded-2xl flex items-center gap-3 text-sm font-medium">
+                                <Clock size={20} className="animate-pulse" />
+                                Confirming booking...
                             </div>
                         ) : (
                             <div className="space-y-3">
@@ -633,52 +618,21 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
                                         Test mode — no real money will be charged
                                     </div>
                                 )}
-                                {paymentMethod === PaymentMethod.ONLINE && rawSplitCode && !rawSplitCode.startsWith('SPL_') && (
-                                    <div className="p-3 bg-[#FF3B30]/10 text-[#FF3B30] rounded-xl text-sm font-medium">
-                                        <AlertCircle size={16} className="inline mr-2" />
-                                        Invalid split code format. Split code must start with "SPL_". Current value: "{rawSplitCode.substring(0, 20)}..."
-                                    </div>
-                                )}
-                                <div className="[&>button]:w-full [&>button]:h-14 [&>button]:bg-[#007AFF] [&>button]:text-white [&>button]:rounded-full [&>button]:font-semibold [&>button]:text-lg [&>button]:shadow-xl [&>button]:hover:bg-[#0066CC] [&>button]:transition-all [&>button]:disabled:opacity-50 [&>button]:disabled:cursor-not-allowed">
-                                    {(() => {
-                                        const basePrice = selectedService.price;
-                                        const total = basePrice + 50;
-                                        const deposit = depositOption === 'deposit' ? total / 2 : total;
-                                        const creatorShare = 50 + basePrice * 0.10;
-                                        // Cap creator's split at total deposit if it's a deposit payment to prevent invalid transaction amounts on cheap services
-                                        const creatorShareForTransaction = depositOption === 'deposit'
-                                            ? Math.min(creatorShare, deposit)
-                                            : creatorShare;
-
-                                        return (
-                                            <>
-                                            <PaystackButton
-                                                publicKey={paystackPublicKey}
-                                                email={paystackEmail} // synthesized from phone to satisfy email format
-                                                amount={Math.round(deposit * 100)} // cents
-                                                currency="ZAR"
-                                                reference={`WAYLINS-${Date.now()}-${uuidv4().substring(0, 8)}`}
-                                                metadata={{ phone: phoneDigits, mode: paymentEnv?.mode } as any}
-                                                // Test mode has no real subaccount: never send split params there.
-                                                split_code={!isTestMode && !paystackSubaccount ? paystackSplitCode || undefined : undefined}
-                                                subaccount={!isTestMode ? paystackSubaccount || undefined : undefined}
-                                                transaction_charge={!isTestMode && paystackSubaccount ? Math.round(creatorShareForTransaction * 100) : undefined}
-                                                bearer={!isTestMode && paystackSubaccount ? "subaccount" : undefined}
-                                                text={
-                                                  isProcessingPayment
-                                                    ? "Processing..."
-                                                    : rescheduleBooking
-                                                      ? `Pay & Reschedule (R${deposit})`
-                                                      : `Pay Now (R${deposit})`
-                                                }
-                                                onSuccess={handlePaymentSuccess}
-                                                onClose={handlePaymentClose}
-                                                disabled={isProcessingPayment}
-                                            />
-                                            </>
-                                        );
-                                    })()}
-                                </div>
+                                <Button
+                                    fullWidth
+                                    variant="primary"
+                                    className="h-14 text-lg shadow-xl"
+                                    disabled={isProcessingPayment || quote === null}
+                                    onClick={handlePay}
+                                >
+                                    {isProcessingPayment
+                                        ? 'Processing...'
+                                        : quote === null
+                                            ? 'Loading price…'
+                                            : rescheduleBooking
+                                                ? `Pay & Reschedule (R${quote.total})`
+                                                : `Pay Now (R${quote.total})`}
+                                </Button>
                                 {isProcessingPayment && (
                                     <div className="text-center text-sm text-[#8E8E93] font-medium">
                                         Processing payment...
@@ -706,14 +660,14 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
                         disabled={
                             (step === 1 && !selectedService) || 
                             (step === 2 && (!selectedDate || !selectedSlot)) ||
-                            (step === 3 && (!paymentMethod || !depositOption)) ||
+                            (step === 3 && !paymentMethod) ||
                             isLoading ||
                             isProcessingPayment
                         }
                         onClick={() => {
                             if(step === 1) setStep(2);
                             else if(step === 2) setStep(3);
-                            else if(step === 3) handleBook();
+                            else if(step === 3) handlePay();
                         }}
                         className="shadow-xl"
                     >

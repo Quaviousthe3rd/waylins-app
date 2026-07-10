@@ -9,6 +9,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@paystack/inline-js": "^2.23.1",
     "date-fns": "^3.3.1",
     "firebase": "^10.14.1",
     "lucide-react": "^0.344.0",

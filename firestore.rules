@@ -2,13 +2,11 @@ rules_version = '2';
 
 // INTERIM RULES — documented trust boundary, not the final state.
 //
-// Public read on bookings and public create on bookings are left open ONLY
-// as a documented interim until the Cloud Functions phase, when booking
-// creation and payment verification move server-side (Paystack webhook +
-// callable functions). At that point:
-//   - bookings read will be restricted (clients query via a function),
-//   - bookings create will be denied to clients entirely.
-// Do not treat the open bookings rules below as acceptable long-term.
+// Booking creation is now server-only (Paystack webhook, Admin SDK).
+// Public READ on bookings remains open ONLY as a documented interim: the
+// client portal's payment-confirmation listener and MyBookings both query
+// the collection directly. Next step: move client reads behind a callable
+// function and restrict read here.
 
 service cloud.firestore {
   match /databases/{database}/documents {
@@ -38,9 +36,14 @@ service cloud.firestore {
       allow write: if false;
     }
 
+    // Bookings are created ONLY server-side (paystackWebhook via Admin SDK,
+    // which bypasses rules) — clients can no longer write bookings.
+    // Public read stays open as a documented interim: the client portal's
+    // post-payment confirmation listener queries bookings by
+    // paymentReference, and MyBookings reads by phone.
     match /bookings/{id} {
       allow read: if true;
-      allow create: if true;
+      allow create: if isAdmin();
       allow update, delete: if isAdmin();
     }
 
