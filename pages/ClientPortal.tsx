@@ -255,6 +255,9 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
   }, [selectedService]);
 
   const isTestMode = paymentEnv?.mode === 'test';
+  // Server-side config validation failed (or getPaymentMode was unreachable):
+  // show a clean "unavailable" state instead of a broken checkout.
+  const isPaymentUnavailable = paymentEnv?.mode === 'unavailable';
 
   // Payment succeeded on the server-created transaction. The webhook writes
   // the booking; we only WAIT for it to appear (no client-side write, ever).
@@ -610,6 +613,14 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
                             <div className="p-4 bg-[#F2F2F7] text-[#8E8E93] rounded-2xl flex items-center gap-3 text-sm font-medium">
                                 <Clock size={20} className="animate-pulse" />
                                 Confirming booking...
+                            </div>
+                        ) : isPaymentUnavailable ? (
+                            <div className="p-4 bg-[#FF3B30]/10 text-[#FF3B30] rounded-2xl flex items-start gap-3 text-sm font-medium">
+                                <AlertCircle size={20} className="shrink-0 mt-0.5" />
+                                <div>
+                                    Online payment is temporarily unavailable.
+                                    Please contact the shop to book your appointment.
+                                </div>
                             </div>
                         ) : (
                             <div className="space-y-3">

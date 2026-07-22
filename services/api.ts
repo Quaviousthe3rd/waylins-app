@@ -132,11 +132,12 @@ const sendTelegramNotification = async (message: string) => {
 // --- PAYMENT ENVIRONMENT ---
 // Which Paystack environment is active, decided server-side in
 // settings/paymentConfig. The public key comes from the server too, so
-// switching modes never requires a client rebuild. On any failure we fall
-// back to live-with-no-key: the UI then uses the env var it always used,
-// so the live path behaves exactly as before this feature existed.
+// switching modes never requires a client rebuild. The server validates the
+// config strictly and throws on anything invalid; when that (or any other
+// failure) happens the mode is 'unavailable' — the wizard shows a clean
+// "online payment temporarily unavailable" state. We NEVER fall back to live.
 export interface PaymentEnv {
-    mode: 'test' | 'live';
+    mode: 'test' | 'live' | 'unavailable';
     publicKey: string | null;
 }
 
@@ -160,19 +161,23 @@ export interface InitTransactionResult {
 }
 
 const fetchPaymentEnv = async (): Promise<PaymentEnv> => {
-    if (!firebaseApp) return { mode: 'live', publicKey: null };
+    if (!firebaseApp) return { mode: 'unavailable', publicKey: null };
     try {
         const functions = getFunctions(firebaseApp, 'europe-west1');
         const call = httpsCallable(functions, 'getPaymentMode');
         const result: any = await call();
-        const mode = result?.data?.mode === 'test' ? 'test' : 'live';
+        const mode = result?.data?.mode;
         const publicKey = typeof result?.data?.publicKey === 'string' && result.data.publicKey.startsWith('pk_')
             ? result.data.publicKey
             : null;
+        if ((mode !== 'test' && mode !== 'live') || !publicKey) {
+            console.error('getPaymentMode returned an invalid environment; payments unavailable.', result?.data);
+            return { mode: 'unavailable', publicKey: null };
+        }
         return { mode, publicKey };
     } catch (e) {
-        console.error('getPaymentMode failed; defaulting to live.', e);
-        return { mode: 'live', publicKey: null };
+        console.error('getPaymentMode failed; payments unavailable.', e);
+        return { mode: 'unavailable', publicKey: null };
     }
 };
 

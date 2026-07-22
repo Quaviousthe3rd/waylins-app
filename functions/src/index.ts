@@ -18,14 +18,87 @@ const PAYSTACK_SECRET_KEY_TEST = defineSecret("PAYSTACK_SECRET_KEY_TEST");
 
 // --- Payment mode ---
 // settings/paymentConfig.mode switches the ENTIRE money path between
-// Paystack live and test integrations. Anything other than the literal
-// string "test" (including a missing field) means LIVE — the live path is
-// the default and is never altered by test-mode logic.
+// Paystack live and test integrations.
 type PaymentMode = "test" | "live";
-const paymentModeOf = (payCfg: any): PaymentMode =>
-  payCfg?.mode === "test" ? "test" : "live";
 const secretKeyFor = (mode: PaymentMode): string =>
   mode === "test" ? PAYSTACK_SECRET_KEY_TEST.value() : PAYSTACK_SECRET_KEY.value();
+
+// --- Payment config validation (fail loud) ---
+// A trailing space in a field name ("mode ") once silently armed live mode
+// with no public key; a checkout in that state would have created a REAL
+// charge. Every money-path function validates the config through here and
+// REFUSES to serve checkout on anything not explicitly valid. There is no
+// fallback to live, ever.
+const KNOWN_PAYMENT_CONFIG_FIELDS = new Set([
+  "mode",
+  "publicKeyTest",
+  "publicKeyLive",
+  "subaccountCode",
+  "feePercent",
+  "feeFlatRand",
+  "roundToRand",
+  "barberBufferRand",
+]);
+
+interface ValidPaymentConfig {
+  mode: PaymentMode;
+  publicKey: string;
+  subaccountCode: string;
+}
+
+// Fatal config problem: log, alert the Telegram group (so a broken config is
+// visible in minutes, not sessions), and refuse to serve checkout.
+const paymentConfigError = async (detail: string): Promise<HttpsError> => {
+  console.error(`PAYMENT_CONFIG_INVALID: ${detail}`);
+  await sendTelegram(
+    `🚨 <b>Payment config invalid — checkout disabled</b>\n${escapeHTML(detail)}\nFix settings/paymentConfig. Online payment is refused until this is corrected.`
+  );
+  return new HttpsError(
+    "failed-precondition",
+    `Payment configuration invalid: ${detail}`
+  );
+};
+
+const validatePaymentConfig = async (payCfg: any): Promise<ValidPaymentConfig> => {
+  if (!payCfg || typeof payCfg !== "object") {
+    throw await paymentConfigError(
+      "settings/paymentConfig is missing or empty"
+    );
+  }
+  // Unknown field names (this is exactly what "mode " was): loud warning +
+  // Telegram alert, but NOT fatal — a harmless extra field must never kill
+  // payments. Only the three required checks below are fatal.
+  const unknown = Object.keys(payCfg).filter(
+    (k) => !KNOWN_PAYMENT_CONFIG_FIELDS.has(k)
+  );
+  if (unknown.length > 0) {
+    const list = unknown.map((k) => JSON.stringify(k)).join(", ");
+    console.warn(`PAYMENT_CONFIG_UNKNOWN_FIELDS: ${list}`);
+    await sendTelegram(
+      `⚠️ <b>Unexpected field(s) on settings/paymentConfig</b>\n${escapeHTML(list)}\nPayments still work, but check for typos (a trailing space in a field name once silently broke checkout).`
+    );
+  }
+  const mode = payCfg.mode;
+  if (mode !== "test" && mode !== "live") {
+    throw await paymentConfigError(
+      `mode is ${JSON.stringify(mode)} — must be exactly "test" or "live"`
+    );
+  }
+  const keyField = mode === "test" ? "publicKeyTest" : "publicKeyLive";
+  const publicKey = payCfg[keyField];
+  if (typeof publicKey !== "string" || !publicKey.startsWith("pk_")) {
+    throw await paymentConfigError(
+      `${keyField} is missing or does not start with "pk_"`
+    );
+  }
+  const subaccountCode = payCfg.subaccountCode;
+  if (typeof subaccountCode !== "string" || !subaccountCode.startsWith("ACCT_")) {
+    throw await paymentConfigError(
+      `subaccountCode is missing or does not start with "ACCT_"`
+    );
+  }
+  return { mode, publicKey, subaccountCode };
+};
 
 // Healthcheck: verifies the deploy pipeline end-to-end before any money logic.
 export const ping = onRequest(
@@ -126,7 +199,14 @@ const makeReference = (): string => {
 };
 
 export const initTransaction = onCall(
-  { secrets: [PAYSTACK_SECRET_KEY, PAYSTACK_SECRET_KEY_TEST] },
+  {
+    secrets: [
+      PAYSTACK_SECRET_KEY,
+      PAYSTACK_SECRET_KEY_TEST,
+      TELEGRAM_BOT_TOKEN,
+      TELEGRAM_CHAT_ID,
+    ],
+  },
   async (request) => {
     const { serviceId, date, timeSlot, clientName, clientPhone } =
       request.data ?? {};
@@ -220,17 +300,10 @@ export const initTransaction = onCall(
     }
 
     // 4. Payment routing config (server-only doc; clients can't read it).
+    //    Strictly validated — an invalid config refuses checkout entirely
+    //    rather than ever falling through to live.
     const paySnap = await db.doc("settings/paymentConfig").get();
-    const mode = paymentModeOf(paySnap.data());
-    // Test mode has no real subaccount: skip the split entirely. In live
-    // mode the subaccount is mandatory — unchanged.
-    const subaccountCode: string | undefined = paySnap.data()?.subaccountCode;
-    if (mode === "live" && (!subaccountCode || !subaccountCode.startsWith("ACCT_"))) {
-      throw new HttpsError(
-        "failed-precondition",
-        "Online payment is not configured. Please choose pay in person."
-      );
-    }
+    const { mode, subaccountCode } = await validatePaymentConfig(paySnap.data());
 
     // 5. Amounts.
     const quote = computeQuote(Math.round(basePriceRand * 100), readFeeConfig(paySnap.data()));
@@ -329,7 +402,9 @@ export const initTransaction = onCall(
 
 // Public quote: what a booking will cost and how it splits, computed with the
 // same code path as initTransaction. Never exposes the subaccount code.
-export const quoteService = onCall(async (request) => {
+export const quoteService = onCall(
+  { secrets: [TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID] },
+  async (request) => {
   const { serviceId } = request.data ?? {};
   if (typeof serviceId !== "string" || !serviceId.trim()) {
     throw new HttpsError("invalid-argument", "serviceId is required.");
@@ -342,6 +417,8 @@ export const quoteService = onCall(async (request) => {
     throw new HttpsError("not-found", "Unknown service.");
   }
   const paySnap = await db.doc("settings/paymentConfig").get();
+  // Fail loud on a broken config before quoting a price for it.
+  await validatePaymentConfig(paySnap.data());
   const quote = computeQuote(
     Math.round(Number(service.price) * 100),
     readFeeConfig(paySnap.data())
@@ -353,20 +430,21 @@ export const quoteService = onCall(async (request) => {
     barberNet: randFromCents(quote.barberNetCents),
     ownerCut: randFromCents(quote.ownerCutCents),
   };
-});
+  }
+);
 
 // Public, non-sensitive payment environment for the client UI: which mode
 // is active and which Paystack PUBLIC key to mount checkout with. Public
 // keys live in settings/paymentConfig as publicKeyLive / publicKeyTest.
 // Never returns secrets or the subaccount code.
-export const getPaymentMode = onCall(async () => {
-  const payCfg = (await db.doc("settings/paymentConfig").get()).data();
-  const mode = paymentModeOf(payCfg);
-  const raw = mode === "test" ? payCfg?.publicKeyTest : payCfg?.publicKeyLive;
-  const publicKey =
-    typeof raw === "string" && raw.trim().startsWith("pk_") ? raw.trim() : null;
-  return { mode, publicKey };
-});
+export const getPaymentMode = onCall(
+  { secrets: [TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID] },
+  async () => {
+    const payCfg = (await db.doc("settings/paymentConfig").get()).data();
+    const { mode, publicKey } = await validatePaymentConfig(payCfg);
+    return { mode, publicKey };
+  }
+);
 
 // --- Telegram (server-side, NEW bot) ---
 // Sent only AFTER Firestore writes commit; a Telegram failure is logged and
