@@ -1,4 +1,3 @@
-import { v4 as uuidv4 } from 'uuid';
 import { 
   Booking, 
   StoreConfig, 
@@ -86,48 +85,9 @@ const notifyListeners = () => {
   });
 };
 
-const escapeHTML = (str: string) => {
-    if (!str) return '';
-    return str.replace(/[&<>"']/g, (m) => {
-        switch (m) {
-            case '&': return '&amp;';
-            case '<': return '&lt;';
-            case '>': return '&gt;';
-            case '"': return '&quot;';
-            case "'": return '&#39;';
-            default: return m;
-        }
-    });
-};
-
-const sendTelegramNotification = async (message: string) => {
-    const token = import.meta.env.VITE_TELEGRAM_BOT_TOKEN;
-    const chatId = import.meta.env.VITE_TELEGRAM_CHAT_ID;
-    
-    if (!token || !chatId) {
-        console.warn("Telegram credentials missing. Notification not sent.");
-        return;
-    }
-    
-    try {
-        const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                chat_id: chatId,
-                text: message,
-                parse_mode: 'HTML'
-            })
-        });
-
-        if (!response.ok) {
-            const errorBody = await response.json();
-            console.error("Telegram API Error Details:", errorBody);
-        }
-    } catch (error) {
-        console.error("Failed to send Telegram notification:", error);
-    }
-};
+// NOTE: the old client-side Telegram sender is gone. Booking lifecycle
+// messages will be owned by the C1 server-side Firestore trigger; the old
+// bot token it used was revoked anyway.
 
 // --- PAYMENT ENVIRONMENT ---
 // Which Paystack environment is active, decided server-side in
@@ -219,6 +179,28 @@ export const api = {
           access_code: result?.data?.access_code ?? null,
           authorization_url: String(result?.data?.authorization_url),
       };
+  },
+
+  // Move an EXISTING booking to a new date/time (server-side callable).
+  // The original payment stays valid — no new charge, no Paystack call.
+  rescheduleBooking: async (payload: {
+      bookingId: string;
+      clientPhone: string;
+      newDate: string;
+      newTimeSlot: string;
+  }): Promise<void> => {
+      if (!firebaseApp) throw new Error('Database not connected.');
+      const functions = getFunctions(firebaseApp, 'europe-west1');
+      const call = httpsCallable(functions, 'rescheduleBooking');
+      await call(payload);
+  },
+
+  // Client cancel via callable (direct booking writes are admin-only).
+  cancelBooking: async (bookingId: string, clientPhone: string): Promise<void> => {
+      if (!firebaseApp) throw new Error('Database not connected.');
+      const functions = getFunctions(firebaseApp, 'europe-west1');
+      const call = httpsCallable(functions, 'cancelBooking');
+      await call({ bookingId, clientPhone });
   },
 
   // Wait for the webhook-created booking to appear (paymentReference match).
@@ -429,61 +411,14 @@ export const api = {
   },
 
   // --- WRITE OPERATIONS ---
-
-  createBooking: async (bookingData: Omit<Booking, 'id' | 'createdAt' | 'status'>, rescheduleId?: string): Promise<Booking> => {
-     const id = uuidv4();
-     const newBooking: Booking = {
-         id,
-         ...bookingData,
-         status: BookingStatus.CONFIRMED,
-         createdAt: new Date().toISOString()
-     };
-
-     if (db) {
-         // Direct atomic write with specific ID
-         await setDoc(doc(db, 'bookings', id), newBooking);
-         
-         // Send Telegram Notification
-         const message = `🚨 <b>New Booking!</b>\n\n` +
-             `👤 <b>Client:</b> ${escapeHTML(bookingData.clientName)}\n` +
-             `📱 <b>Phone:</b> ${escapeHTML(bookingData.clientPhone)}\n` +
-             `✂️ <b>Service:</b> ${escapeHTML(bookingData.serviceName)}\n` +
-             `📅 <b>Date:</b> ${escapeHTML(bookingData.date)}\n` +
-             `⏰ <b>Time:</b> ${escapeHTML(bookingData.timeSlot)}\n` +
-             `💰 <b>Total:</b> R${bookingData.amount}\n` +
-             `💳 <b>Payment:</b> ${escapeHTML(bookingData.paymentMethod)} (${escapeHTML(bookingData.paymentStatus)})`;
-         
-         sendTelegramNotification(message);
-
-         return newBooking;
-     } else {
-         throw new Error("Database not connected. Please check internet or API Keys.");
-     }
-  },
+  // NOTE: bookings are CREATED only server-side (paystackWebhook). Direct
+  // updates here work only for the authenticated admin (Firestore rules);
+  // clients cancel/reschedule via the callables below.
 
   updateBooking: async (id: string, updates: Partial<Booking>) => {
      if (db) {
          const docRef = doc(db, 'bookings', id);
-         await updateDoc(docRef, updates);
-         
-         // If status is updated (like CANCELLED) or payment updated, send a notification
-         if (updates.status || updates.paymentStatus) {
-             const booking = bookingsCache.find(b => b.id === id);
-             const clientName = booking?.clientName || 'Unknown Client';
-             
-             let message = `⚠️ <b>Booking Updated</b>\n\n`;
-             message += `👤 <b>Client:</b> ${escapeHTML(clientName)}\n`;
-             
-             if (updates.status) {
-                 message += `📌 <b>Status:</b> ${updates.status}\n`;
-             }
-             if (updates.paymentStatus) {
-                 message += `💰 <b>Payment:</b> ${updates.paymentStatus}\n`;
-             }
-             
-             message += `\nID: <code>${id}</code>`;
-             sendTelegramNotification(message);
-         }
+         await updateDoc(docRef, updates as any);
      } else {
          throw new Error("Database not connected.");
      }

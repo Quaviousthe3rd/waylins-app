@@ -27,7 +27,7 @@
 
 ## Phase A - Money correctness (before going live)
 
-### A1. Config validation, fail loud
+### A1. Config validation, fail loud — DONE (2026-07-23, commit 9ccc875)
 The trailing-space incident silently armed live mode with no public key, and a checkout attempt in that state would have created a real charge. Fix the class of bug, not the instance:
 - `getPaymentMode` and `initTransaction` must reject a config that is not explicitly valid: `mode` must be exactly `"test"` or `"live"`, the matching public key must be present and start with `pk_`, `subaccountCode` must start with `ACCT_`.
 - Anything else throws a clear error and refuses to serve checkout. Never silently fall through to live.

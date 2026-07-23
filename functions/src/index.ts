@@ -446,6 +446,135 @@ export const getPaymentMode = onCall(
   }
 );
 
+// --- Booking lifecycle callables (no money movement) ---
+// Ownership is proven by clientPhone matching the booking's stored phone —
+// the same (accepted-risk) trust level as the phone-number booking lookup.
+// Neither callable touches Paystack or payment fields, and neither sends
+// Telegram: the C1 Firestore trigger will own booking lifecycle messages.
+
+const requireOwnedBooking = (
+  snap: FirebaseFirestore.DocumentSnapshot,
+  clientPhone: unknown
+): any => {
+  if (typeof clientPhone !== "string" || !clientPhone.trim()) {
+    throw new HttpsError("invalid-argument", "clientPhone is required.");
+  }
+  if (!snap.exists) {
+    throw new HttpsError("not-found", "Booking not found.");
+  }
+  const booking = snap.data() as any;
+  if (String(booking.clientPhone ?? "") !== clientPhone.trim()) {
+    throw new HttpsError(
+      "permission-denied",
+      "This booking belongs to a different phone number."
+    );
+  }
+  return booking;
+};
+
+// Reschedule = move the EXISTING booking to a new date/time. The original
+// payment stays valid; NO new charge, NO new booking doc, ZERO Paystack
+// calls. Payment fields (paymentStatus, paymentReference, transactionId,
+// amount) are never touched.
+export const rescheduleBooking = onCall(async (request) => {
+  const { bookingId, clientPhone, newDate, newTimeSlot } = request.data ?? {};
+  if (typeof bookingId !== "string" || !bookingId.trim()) {
+    throw new HttpsError("invalid-argument", "bookingId is required.");
+  }
+  if (typeof newDate !== "string" || !DATE_RE.test(newDate)) {
+    throw new HttpsError("invalid-argument", "newDate must be yyyy-MM-dd.");
+  }
+  if (typeof newTimeSlot !== "string" || !TIME_RE.test(newTimeSlot)) {
+    throw new HttpsError("invalid-argument", "newTimeSlot must be HH:mm.");
+  }
+
+  const bookingRef = db.doc(`bookings/${bookingId}`);
+
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(bookingRef);
+    const booking = requireOwnedBooking(snap, clientPhone);
+    if (booking.status === "Cancelled") {
+      throw new HttpsError(
+        "failed-precondition",
+        "This booking has been cancelled and cannot be rescheduled."
+      );
+    }
+
+    // The new slot must be free — same overlap logic as getAvailableSlots,
+    // EXCLUDING this booking's own current slot, with the || 60 duration
+    // fallback for legacy docs.
+    const durationMinutes = Number(booking.durationMinutes) || 60;
+    const slotStart = toMinutes(newTimeSlot);
+    const slotEnd = slotStart + durationMinutes;
+
+    const sameDay = await tx.get(
+      db.collection("bookings").where("date", "==", newDate)
+    );
+    const taken = sameDay.docs.some((d) => {
+      if (d.id === bookingId) return false;
+      const other = d.data();
+      if (other.status === "Cancelled") return false;
+      const oStart = toMinutes(String(other.timeSlot ?? "00:00"));
+      const oEnd = oStart + (Number(other.durationMinutes) || 60);
+      return overlaps(slotStart, slotEnd, oStart, oEnd);
+    });
+    if (taken) {
+      throw new HttpsError(
+        "already-exists",
+        "That time slot has just been taken. Please pick another slot."
+      );
+    }
+
+    const storeSnap = await tx.get(db.doc("settings/storeConfig"));
+    const blocked = (storeSnap.data()?.blockouts ?? []).some((b: any) => {
+      if (b.date !== newDate) return false;
+      return overlaps(slotStart, slotEnd, toMinutes(b.startTime), toMinutes(b.endTime));
+    });
+    if (blocked) {
+      throw new HttpsError(
+        "already-exists",
+        "That time is no longer available. Please pick another slot."
+      );
+    }
+
+    tx.update(bookingRef, {
+      date: newDate,
+      timeSlot: newTimeSlot,
+      rescheduledFrom: {
+        date: String(booking.date ?? ""),
+        timeSlot: String(booking.timeSlot ?? ""),
+        at: FieldValue.serverTimestamp(),
+      },
+    });
+  });
+
+  return { ok: true, bookingId, date: newDate, timeSlot: newTimeSlot };
+});
+
+// Client-side cancel. No refund — refunds stay manual and human-decided.
+export const cancelBooking = onCall(async (request) => {
+  const { bookingId, clientPhone } = request.data ?? {};
+  if (typeof bookingId !== "string" || !bookingId.trim()) {
+    throw new HttpsError("invalid-argument", "bookingId is required.");
+  }
+
+  const bookingRef = db.doc(`bookings/${bookingId}`);
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(bookingRef);
+    const booking = requireOwnedBooking(snap, clientPhone);
+    if (booking.status === "Cancelled") {
+      return; // Already cancelled — idempotent success.
+    }
+    tx.update(bookingRef, {
+      status: "Cancelled",
+      cancelledBy: "client",
+      cancelledAt: FieldValue.serverTimestamp(),
+    });
+  });
+
+  return { ok: true, bookingId };
+});
+
 // --- Telegram (server-side, NEW bot) ---
 // Sent only AFTER Firestore writes commit; a Telegram failure is logged and
 // never fails the webhook response.

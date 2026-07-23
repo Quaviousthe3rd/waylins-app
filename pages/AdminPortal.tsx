@@ -142,7 +142,12 @@ const BookingsTab: React.FC = () => {
 
   const updateStatus = async (booking: Booking, status: BookingStatus) => {
     try {
-        await api.updateBooking(booking.id, { status });
+        await api.updateBooking(booking.id, {
+            status,
+            ...(status === BookingStatus.CANCELLED
+                ? { cancelledBy: 'admin' as const, cancelledAt: new Date().toISOString() }
+                : {}),
+        });
         notify.success(`Booking ${status.toLowerCase()} successfully`);
     } catch (e) {
         console.error('Update failed', e);

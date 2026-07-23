@@ -268,14 +268,6 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
     try {
       const booking = await api.waitForBookingByReference(reference, 60_000);
       if (booking) {
-        // Best-effort cancel of the old booking when rescheduling.
-        if (rescheduleBooking) {
-          try {
-            await api.updateBooking(rescheduleBooking.id, { status: BookingStatus.CANCELLED });
-          } catch (e) {
-            console.warn('Could not auto-cancel old booking during reschedule', e);
-          }
-        }
         setFinalBooking(booking);
         setStep(5);
         notify.success('Booking confirmed! Payment successful.');
@@ -284,6 +276,32 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
       }
     } finally {
       setIsConfirming(false);
+    }
+  };
+
+  // Reschedule = move the EXISTING booking server-side. NO payment step,
+  // NO Paystack — the original payment stays valid.
+  const handleConfirmReschedule = async () => {
+    if (!rescheduleBooking || !selectedDate || !selectedSlot || isLoading) return;
+    setIsLoading(true);
+    setError(null);
+    try {
+      await api.rescheduleBooking({
+        bookingId: rescheduleBooking.id,
+        clientPhone: client.phone,
+        newDate: selectedDate,
+        newTimeSlot: selectedSlot,
+      });
+      setFinalBooking({ ...rescheduleBooking, date: selectedDate, timeSlot: selectedSlot });
+      setStep(5);
+      notify.success('Appointment rescheduled. No new charge.');
+      api.refresh();
+    } catch (e: any) {
+      console.error('rescheduleBooking failed', e);
+      setError(e?.message || 'Could not reschedule. Please try again.');
+      api.refresh();
+    } finally {
+      setIsLoading(false);
     }
   };
 
@@ -368,7 +386,11 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
                 </div>
                 <div className="text-right">
                   <div className="text-[11px] font-bold text-[#8E8E93] uppercase tracking-widest mb-1">Total</div>
-                  <div className="text-2xl font-bold text-[#1C1C1E]">R{finalBooking.amount}</div>
+                  {rescheduleBooking ? (
+                    <div className="text-lg font-bold text-[#34C759]">No new charge</div>
+                  ) : (
+                    <div className="text-2xl font-bold text-[#1C1C1E]">R{finalBooking.amount}</div>
+                  )}
                 </div>
               </div>
             </div>
@@ -435,7 +457,7 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
                <div className="mb-6 p-4 bg-[#007AFF]/10 text-[#007AFF] rounded-2xl flex items-start gap-3 text-sm font-medium animate-in slide-in-from-top-2">
                    <RotateCcw size={20} className="shrink-0 mt-0.5"/>
                    <div>
-                       You are rescheduling. Your previous booking for <strong>{format(new Date(rescheduleBooking.date), 'MMM d')} at {rescheduleBooking.timeSlot}</strong> will be cancelled when you confirm this new booking.
+                       You are rescheduling. Your booking for <strong>{format(new Date(rescheduleBooking.date), 'MMM d')} at {rescheduleBooking.timeSlot}</strong> will be moved to the new time you pick. Your original payment stays valid — no new charge.
                    </div>
                </div>
            )}
@@ -640,9 +662,7 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
                                         ? 'Processing...'
                                         : quote === null
                                             ? 'Loading price…'
-                                            : rescheduleBooking
-                                                ? `Pay & Reschedule (R${quote.total})`
-                                                : `Pay Now (R${quote.total})`}
+                                            : `Pay Now (R${quote.total})`}
                                 </Button>
                                 {isProcessingPayment && (
                                     <div className="text-center text-sm text-[#8E8E93] font-medium">
@@ -677,12 +697,20 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
                         }
                         onClick={() => {
                             if(step === 1) setStep(2);
-                            else if(step === 2) setStep(3);
+                            // Reschedule ends at step 2: confirm moves the
+                            // existing booking — the payment step never runs.
+                            else if(step === 2) rescheduleBooking ? handleConfirmReschedule() : setStep(3);
                             else if(step === 3) handlePay();
                         }}
                         className="shadow-xl"
                     >
-                        {isLoading ? 'Processing...' : (step === 3 ? (rescheduleBooking ? 'Confirm & Reschedule' : 'Confirm Booking') : 'Continue')}
+                        {isLoading
+                            ? 'Processing...'
+                            : step === 2 && rescheduleBooking
+                                ? 'Confirm Reschedule'
+                                : step === 3
+                                    ? 'Confirm Booking'
+                                    : 'Continue'}
                     </Button>
                 )}
                 {/* Show message when processing online payment */}
@@ -713,7 +741,8 @@ const MyBookings: React.FC<{ client: Client, onBack: () => void, onReschedule: (
     const handleCancel = async (id: string) => {
         if(confirm('Cancel this appointment?')) {
             try {
-                await api.updateBooking(id, { status: BookingStatus.CANCELLED });
+                // Server-side callable: direct booking writes are admin-only.
+                await api.cancelBooking(id, client.phone);
                 notify.success('Appointment cancelled successfully');
             } catch (e) {
                 console.warn(e);
