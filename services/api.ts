@@ -78,6 +78,17 @@ try {
 // --- STATE MANAGEMENT ---
 let bookingsCache: Booking[] = [];
 let configCache: StoreConfig = INITIAL_CONFIG;
+// slotClaims cache: cell id "yyyy-MM-dd_HH:mm" -> claim. Written only
+// server-side; public-read (no personal data). Availability excludes any
+// confirmed or held-and-unexpired cell. Advisory only — the server-side
+// claim transaction is the real enforcement.
+interface SlotClaim {
+    bookingRef: string | null;
+    bookingId: string | null;
+    status: 'held' | 'confirmed';
+    expiresAt: Date | null;
+}
+let claimsCache: Map<string, SlotClaim> = new Map();
 let listeners: (() => void)[] = [];
 let isSubscribed = false;
 
@@ -330,6 +341,24 @@ export const api = {
                 console.error("Firebase Sync Error:", error);
             });
 
+            // 1b. Listen to slot claims (server-written reservation cells).
+            onSnapshot(collection(db, 'slotClaims'), (snapshot) => {
+                const next = new Map<string, SlotClaim>();
+                snapshot.docs.forEach(d => {
+                    const c = d.data() as any;
+                    next.set(d.id, {
+                        bookingRef: c.bookingRef ? String(c.bookingRef) : null,
+                        bookingId: c.bookingId ? String(c.bookingId) : null,
+                        status: c.status === 'held' ? 'held' : 'confirmed',
+                        expiresAt: c.expiresAt?.toDate ? c.expiresAt.toDate() : null,
+                    });
+                });
+                claimsCache = next;
+                notifyListeners();
+            }, (error) => {
+                console.error('slotClaims sync error:', error);
+            });
+
             // 2. Listen to Config
             const configRef = doc(db, 'settings', 'storeConfig');
             onSnapshot(configRef, (doc) => {
@@ -457,13 +486,35 @@ export const api = {
           return areIntervalsOverlapping({ start: slotStart, end: slotEnd }, { start: bStart, end: bEnd });
        });
 
+       // Claimed cells (server-side slot reservations). A slot is blocked if
+       // ANY 30-min cell it covers is confirmed, or held and not yet
+       // expired — unless the claim belongs to the booking being
+       // rescheduled (excludeBookingId).
+       const startMin = slotStart.getHours() * 60 + slotStart.getMinutes();
+       const firstCell = Math.floor(startMin / 30);
+       const lastCell = Math.ceil((startMin + durationMinutes) / 30);
+       let isClaimed = false;
+       for (let c = firstCell; c < lastCell; c++) {
+           const m = c * 30;
+           const hh = String(Math.floor(m / 60)).padStart(2, '0');
+           const mm = String(m % 60).padStart(2, '0');
+           const claim = claimsCache.get(`${dateStr}_${hh}:${mm}`);
+           if (!claim) continue;
+           if (excludeBookingId && claim.bookingId === excludeBookingId) continue;
+           if (claim.status === 'confirmed' ||
+               (claim.expiresAt !== null && claim.expiresAt.getTime() > Date.now())) {
+               isClaimed = true;
+               break;
+           }
+       }
+
        const isOverlappingBlockout = dayBlockouts.some(b => {
           const bStart = parse(b.startTime, 'HH:mm', new Date(dateStr));
           const bEnd = parse(b.endTime, 'HH:mm', new Date(dateStr));
           return areIntervalsOverlapping({ start: slotStart, end: slotEnd }, { start: bStart, end: bEnd });
        });
 
-       if (!isOverlappingBooking && !isOverlappingBlockout) {
+       if (!isOverlappingBooking && !isOverlappingBlockout && !isClaimed) {
            slots.push(slotStr);
        }
 

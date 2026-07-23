@@ -47,6 +47,17 @@ service cloud.firestore {
       allow update, delete: if isAdmin();
     }
 
+    // slotClaims: atomic slot reservation cells, written ONLY server-side
+    // (initTransaction / paystackWebhook / callables / trigger via Admin
+    // SDK). Public read is deliberate and verified safe: docs contain only
+    // bookingRef (payment reference), bookingId, status, date/time and
+    // timestamps — no names, no phone numbers, no personal data. The client
+    // reads them to exclude claimed cells from availability.
+    match /slotClaims/{cell} {
+      allow read: if true;
+      allow write: if false;
+    }
+
     // events: booking lifecycle audit trail, written ONLY by the
     // onBookingWritten trigger (Admin SDK). Admin may read; no client writes.
     match /events/{id} {

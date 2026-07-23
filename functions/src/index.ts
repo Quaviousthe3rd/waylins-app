@@ -22,6 +22,8 @@ const db = getFirestore();
 
 const PAYSTACK_SECRET_KEY = defineSecret("PAYSTACK_SECRET_KEY");
 const PAYSTACK_SECRET_KEY_TEST = defineSecret("PAYSTACK_SECRET_KEY_TEST");
+// One-off B2 migration guard (see backfillSlotClaims at the bottom).
+const BACKFILL_TOKEN = defineSecret("BACKFILL_TOKEN");
 
 // --- Payment mode ---
 // settings/paymentConfig.mode switches the ENTIRE money path between
@@ -201,6 +203,59 @@ const toMinutes = (hhmm: string): number => {
 const overlaps = (aStart: number, aEnd: number, bStart: number, bEnd: number) =>
   aStart < bEnd && bStart < aEnd;
 
+// --- Slot claims (B2: atomic double-booking prevention) ---
+// slotClaims/{date}_{HH:mm}: one doc per 30-minute grid cell. A booking that
+// spans several cells claims ALL of them. Claims are created "held" (expire
+// after 15 min) inside initTransaction's Firestore transaction BEFORE the
+// Paystack popup opens, and flipped to "confirmed" in the same transaction
+// that writes the booking. Expired held claims are treated as free inside
+// the claim transaction itself — no scheduler. All claim logic is PURE (no
+// Telegram or other side effects inside transaction bodies): Firestore
+// retries transactions on contention.
+const HOLD_MS = 15 * 60 * 1000;
+
+// Cells are computed by flooring the start to the 30-min grid and covering
+// through ceil(end), so even an off-grid legacy timeSlot maps onto the same
+// cells a grid-aligned booking would claim.
+const cellIdsFor = (
+  date: string,
+  timeSlot: string,
+  durationMinutes: number
+): string[] => {
+  const start = toMinutes(timeSlot);
+  const end = start + Math.max(1, durationMinutes);
+  const first = Math.floor(start / 30);
+  const last = Math.ceil(end / 30); // exclusive
+  const ids: string[] = [];
+  for (let c = first; c < last; c++) {
+    const m = c * 30;
+    const hh = String(Math.floor(m / 60)).padStart(2, "0");
+    const mm = String(m % 60).padStart(2, "0");
+    ids.push(`${date}_${hh}:${mm}`);
+  }
+  return ids;
+};
+
+// A claim blocks unless it belongs to us (by reference or bookingId) or it
+// is a held claim that has already expired (server clock).
+const claimBlocks = (
+  snap: FirebaseFirestore.DocumentSnapshot,
+  nowMs: number,
+  ownRef?: string | null,
+  ownBookingId?: string | null
+): boolean => {
+  if (!snap.exists) return false;
+  const c = snap.data() as any;
+  if (ownRef && c.bookingRef === ownRef) return false;
+  if (ownBookingId && c.bookingId === ownBookingId) return false;
+  if (c.status === "confirmed") return true;
+  if (c.status === "held") {
+    const exp = c.expiresAt?.toMillis?.();
+    return typeof exp === "number" && exp > nowMs;
+  }
+  return false;
+};
+
 const makeReference = (): string => {
   const rand = Array.from({ length: 8 }, () =>
     "ABCDEFGHJKLMNPQRSTUVWXYZ23456789".charAt(Math.floor(Math.random() * 32))
@@ -276,6 +331,35 @@ export const initTransaction = onCall(
       console.error("pendingPayments cleanup failed (non-fatal)", e);
     }
 
+    // 2c. Lazy cleanup of slotClaims, same pattern, best-effort:
+    //     - expired held claims (only held claims carry expiresAt, so this
+    //       single-field query never touches confirmed claims)
+    //     - claims for past dates (confirmed or not — the day is over)
+    try {
+      const now = Timestamp.now();
+      // "Past" = strictly before yesterday (UTC minus 24h), so timezone skew
+      // can never delete a claim for a day that is still in progress locally.
+      const pastCutoff = new Date(Date.now() - 24 * 60 * 60 * 1000)
+        .toISOString()
+        .slice(0, 10);
+      const [expired, past] = await Promise.all([
+        db.collection("slotClaims").where("expiresAt", "<", now).limit(100).get(),
+        db.collection("slotClaims").where("date", "<", pastCutoff).limit(100).get(),
+      ]);
+      const doomed = [...expired.docs, ...past.docs];
+      if (doomed.length > 0) {
+        const batch = db.batch();
+        const seen = new Set<string>();
+        doomed.forEach((d) => {
+          if (!seen.has(d.ref.path)) { seen.add(d.ref.path); batch.delete(d.ref); }
+        });
+        await batch.commit();
+        console.log(`Cleaned up ${seen.size} stale slotClaims.`);
+      }
+    } catch (e) {
+      console.error("slotClaims cleanup failed (non-fatal)", e);
+    }
+
     // 3. Recheck the slot against non-cancelled bookings and blockouts
     //    (same overlap logic as the client's getAvailableSlots).
     const slotStart = toMinutes(timeSlot);
@@ -322,8 +406,55 @@ export const initTransaction = onCall(
       throw new HttpsError("internal", "Pricing configuration error.");
     }
 
-    // 6. Record the intent before contacting Paystack.
+    // 6. ATOMICALLY claim every 30-min cell the service covers, BEFORE the
+    //    Paystack popup opens. One transaction: read all cells, abort with a
+    //    clean "slot taken" if any is confirmed or held-and-unexpired,
+    //    otherwise create them all as held (15-min expiry). Expired held
+    //    claims are treated as free right here — no scheduler. Pure: no side
+    //    effects in the body (Firestore retries on contention).
     const reference = makeReference();
+    const cellIds = cellIdsFor(date, timeSlot, durationMinutes);
+    const cellRefs = cellIds.map((id) => db.doc(`slotClaims/${id}`));
+    await db.runTransaction(async (tx) => {
+      const snaps = await tx.getAll(...cellRefs);
+      const nowMs = Date.now(); // server clock, never a client's
+      if (snaps.some((s) => claimBlocks(s, nowMs))) {
+        throw new HttpsError(
+          "already-exists",
+          "That time slot has just been taken. Please pick another slot."
+        );
+      }
+      const expiresAt = Timestamp.fromMillis(nowMs + HOLD_MS);
+      cellRefs.forEach((ref, i) => {
+        tx.set(ref, {
+          bookingRef: reference,
+          bookingId: null,
+          status: "held",
+          date,
+          time: cellIds[i].slice(date.length + 1),
+          expiresAt,
+          createdAt: FieldValue.serverTimestamp(),
+        });
+      });
+    });
+    // Best-effort release if anything below fails: without this the cells
+    // stay dead for 15 minutes on a Paystack outage.
+    const releaseHeldCells = async () => {
+      try {
+        const batch = db.batch();
+        const snaps = await db.getAll(...cellRefs);
+        snaps.forEach((s) => {
+          if (s.exists && (s.data() as any).bookingRef === reference) {
+            batch.delete(s.ref);
+          }
+        });
+        await batch.commit();
+      } catch (e) {
+        console.error(`could not release held cells for ${reference} (they expire in 15 min)`, e);
+      }
+    };
+
+    // 7. Record the intent before contacting Paystack.
     await db.doc(`pendingPayments/${reference}`).set({
       reference,
       mode,
@@ -351,7 +482,7 @@ export const initTransaction = onCall(
       createdAt: FieldValue.serverTimestamp(),
     });
 
-    // 7. Initialize the Paystack transaction. NOTE: subaccount split with a
+    // 8. Initialize the Paystack transaction. NOTE: subaccount split with a
     //    flat transaction_charge; SPL_ split codes are deliberately not used.
     //    In test mode the split params are omitted (no real subaccount) and
     //    the test secret key is used; everything else is identical.
@@ -395,6 +526,7 @@ export const initTransaction = onCall(
       await db
         .doc(`pendingPayments/${reference}`)
         .set({ status: "init_failed", paystackError: body?.message ?? `HTTP ${resp.status}` }, { merge: true });
+      await releaseHeldCells();
       throw new HttpsError("internal", "Could not start the payment. Please try again.");
     }
 
@@ -547,6 +679,51 @@ export const rescheduleBooking = onCall(async (request) => {
       );
     }
 
+    // Slot claims: release old cells, take new ones, in THIS transaction.
+    // The check excludes this booking's own claims (by bookingId or payment
+    // reference) — otherwise a same-day move to an overlapping time would
+    // deadlock against itself. All reads happen before any write.
+    const ownRef = String(booking.paymentReference ?? "") || null;
+    const oldCellIds = cellIdsFor(
+      String(booking.date ?? ""),
+      String(booking.timeSlot ?? "00:00"),
+      durationMinutes
+    );
+    const newCellIds = cellIdsFor(newDate, newTimeSlot, durationMinutes);
+    const oldCellRefs = oldCellIds.map((id) => db.doc(`slotClaims/${id}`));
+    const newCellRefs = newCellIds.map((id) => db.doc(`slotClaims/${id}`));
+    const [oldSnaps, newSnaps] = await Promise.all([
+      tx.getAll(...oldCellRefs),
+      tx.getAll(...newCellRefs),
+    ]);
+    const nowMs = Date.now();
+    if (newSnaps.some((s) => claimBlocks(s, nowMs, ownRef, bookingId))) {
+      throw new HttpsError(
+        "already-exists",
+        "That time slot has just been taken. Please pick another slot."
+      );
+    }
+    const newIdSet = new Set(newCellIds);
+    oldSnaps.forEach((s, i) => {
+      if (newIdSet.has(oldCellIds[i])) return; // overwritten below
+      if (!s.exists) return;
+      const c = s.data() as any;
+      if (c.bookingId === bookingId || (ownRef && c.bookingRef === ownRef)) {
+        tx.delete(oldCellRefs[i]);
+      }
+    });
+    newCellRefs.forEach((ref, i) => {
+      tx.set(ref, {
+        bookingRef: ownRef,
+        bookingId,
+        status: "confirmed",
+        date: newDate,
+        time: newCellIds[i].slice(newDate.length + 1),
+        expiresAt: null,
+        createdAt: FieldValue.serverTimestamp(),
+      });
+    });
+
     tx.update(bookingRef, {
       date: newDate,
       timeSlot: newTimeSlot,
@@ -575,10 +752,27 @@ export const cancelBooking = onCall(async (request) => {
     if (booking.status === "Cancelled") {
       return; // Already cancelled — idempotent success.
     }
+    // Release this booking's slot claim cells (reads before writes).
+    const ownRef = String(booking.paymentReference ?? "") || null;
+    const cellIds = cellIdsFor(
+      String(booking.date ?? ""),
+      String(booking.timeSlot ?? "00:00"),
+      Number(booking.durationMinutes) || 60
+    );
+    const cellSnaps = await tx.getAll(
+      ...cellIds.map((id) => db.doc(`slotClaims/${id}`))
+    );
     tx.update(bookingRef, {
       status: "Cancelled",
       cancelledBy: "client",
       cancelledAt: FieldValue.serverTimestamp(),
+    });
+    cellSnaps.forEach((s) => {
+      if (!s.exists) return;
+      const c = s.data() as any;
+      if (c.bookingId === bookingId || (ownRef && c.bookingRef === ownRef)) {
+        tx.delete(s.ref);
+      }
     });
   });
 
@@ -617,6 +811,79 @@ export const onBookingWritten = onDocumentWritten(
       ? (event.data.after.data() as any)
       : null;
     if (!before && !after) return;
+
+    // Slot-claim upkeep for writes that do NOT go through a server callable
+    // (admin cancel / delete / date edit are direct Firestore writes from the
+    // portal). Idempotent, so re-running over callable-managed changes is
+    // harmless. Deletes/creates only slotClaims — never bookings/ — and sends
+    // no Telegram (C1 owns lifecycle messages). Best-effort: claim upkeep
+    // must never block the notification path.
+    try {
+      const releaseFor = async (bk: any) => {
+        const ownRef = String(bk.paymentReference ?? "") || null;
+        const ids = cellIdsFor(
+          String(bk.date ?? ""),
+          String(bk.timeSlot ?? "00:00"),
+          Number(bk.durationMinutes) || 60
+        );
+        const snaps = await db.getAll(...ids.map((id) => db.doc(`slotClaims/${id}`)));
+        const batch = db.batch();
+        let any = false;
+        snaps.forEach((s) => {
+          if (!s.exists) return;
+          const c = s.data() as any;
+          if (c.bookingId === bookingId || (ownRef && c.bookingRef === ownRef)) {
+            batch.delete(s.ref);
+            any = true;
+          }
+        });
+        if (any) await batch.commit();
+      };
+      const confirmFor = async (bk: any) => {
+        const ids = cellIdsFor(
+          String(bk.date ?? ""),
+          String(bk.timeSlot ?? "00:00"),
+          Number(bk.durationMinutes) || 60
+        );
+        const batch = db.batch();
+        ids.forEach((id) => {
+          batch.set(db.doc(`slotClaims/${id}`), {
+            bookingRef: String(bk.paymentReference ?? "") || null,
+            bookingId,
+            status: "confirmed",
+            date: String(bk.date ?? ""),
+            time: id.slice(String(bk.date ?? "").length + 1),
+            expiresAt: null,
+            createdAt: FieldValue.serverTimestamp(),
+          });
+        });
+        await batch.commit();
+      };
+
+      const wasCancelled = String(before?.status ?? "") === "Cancelled";
+      const isCancelled = String(after?.status ?? "") === "Cancelled";
+      const moved =
+        before && after &&
+        (String(before.date ?? "") !== String(after.date ?? "") ||
+          String(before.timeSlot ?? "") !== String(after.timeSlot ?? ""));
+
+      if (!before && after && !isCancelled) {
+        // Created. The webhook already confirmed its cells in-transaction
+        // (idempotent overwrite); this also covers admin-created bookings.
+        await confirmFor(after);
+      } else if (before && !after) {
+        await releaseFor(before); // deleted
+      } else if (before && after && !wasCancelled && isCancelled) {
+        await releaseFor(before); // cancelled
+      } else if (before && after && wasCancelled && !isCancelled) {
+        await confirmFor(after); // un-cancelled by admin: re-claim
+      } else if (moved && !isCancelled) {
+        await releaseFor(before); // admin date/time edit: move the claims
+        await confirmFor(after);
+      }
+    } catch (e) {
+      console.error(`slot claim upkeep failed for booking ${bookingId} (non-fatal)`, e);
+    }
 
     // Missing mode (pre-stamping docs) displays as live; this never feeds
     // money logic.
@@ -1041,11 +1308,24 @@ export const paystackWebhook = onRequest(
     const slotEnd = slotStart + durationMinutes;
 
     let slotTaken = false;
+    let orphaned = false;
+    const cellIds = cellIdsFor(String(b.date ?? ""), String(b.timeSlot ?? "00:00"), durationMinutes);
+    const cellRefs = cellIds.map((id) => db.doc(`slotClaims/${id}`));
     try {
       await db.runTransaction(async (tx) => {
+        slotTaken = false;
+        orphaned = false;
+        // All reads first (Firestore transaction rule), then writes.
+        const cellSnaps = await tx.getAll(...cellRefs);
         const sameDay = await tx.get(
           db.collection("bookings").where("date", "==", b.date)
         );
+        const nowMs = Date.now();
+        // Our held claim may have expired and been stolen between init and
+        // webhook. Missing/expired cells we simply re-claim; a cell that is
+        // confirmed or held-unexpired by ANOTHER reference means the slot is
+        // gone — money must not vanish: ORPHANED_PAYMENT + manual refund.
+        const stolen = cellSnaps.some((s) => claimBlocks(s, nowMs, reference));
         const taken = sameDay.docs.some((d) => {
           const other = d.data();
           if (other.status === "Cancelled") return false;
@@ -1054,8 +1334,27 @@ export const paystackWebhook = onRequest(
           return overlaps(slotStart, slotEnd, oStart, oEnd);
         });
 
-        if (taken) {
+        // Whenever we cannot book, drop any cells still held by us so the
+        // slot is not wedged for the winner's neighbours.
+        const releaseOwnCells = () => {
+          cellSnaps.forEach((s, i) => {
+            if (s.exists && (s.data() as any).bookingRef === reference) {
+              tx.delete(cellRefs[i]);
+            }
+          });
+        };
+
+        if (stolen) {
+          orphaned = true;
+          releaseOwnCells();
+          tx.create(ledgerRef, {
+            ...ledgerFull,
+            bookingId: null,
+            status: "ORPHANED_PAYMENT",
+          });
+        } else if (taken) {
           slotTaken = true;
+          releaseOwnCells();
           tx.create(ledgerRef, {
             ...ledgerFull,
             bookingId: null,
@@ -1088,6 +1387,19 @@ export const paystackWebhook = onRequest(
             paymentReference: reference,
             transactionId: data.id != null ? String(data.id) : "",
           });
+          // Flip the reference's cells to confirmed in the SAME transaction
+          // that writes the booking.
+          cellRefs.forEach((ref, i) => {
+            tx.set(ref, {
+              bookingRef: reference,
+              bookingId: bookingRef.id,
+              status: "confirmed",
+              date: String(b.date ?? ""),
+              time: cellIds[i].slice(String(b.date ?? "").length + 1),
+              expiresAt: null,
+              createdAt: FieldValue.serverTimestamp(),
+            });
+          });
         }
         tx.delete(pendingSnap.ref);
       });
@@ -1108,6 +1420,12 @@ export const paystackWebhook = onRequest(
     //    message now. Sending here too would notify every booking twice.
     //    SLOT_TAKEN_REFUND writes no booking doc, so the webhook still owns
     //    that alert.
+    if (orphaned) {
+      await sendTelegram(
+        `🔴 <b>Orphaned payment — slot claim was stolen, refund needed</b>\nClient: ${escapeHTML(bookingFields.clientName)} (${escapeHTML(String(b.clientPhone ?? ""))})\nService: ${escapeHTML(bookingFields.serviceName)}\n${escapeHTML(bookingFields.date)} at ${escapeHTML(bookingFields.timeSlot)}\nPaid: R${randFromCents(chargedCents)}\nReference: <code>${escapeHTML(reference)}</code>\nTheir hold expired and someone else claimed the slot before payment landed. No booking was created — refund manually in the Paystack dashboard.`,
+        eventMode
+      );
+    }
     if (slotTaken) {
       await sendTelegram(
         `🔴 <b>Paid but slot taken — refund needed</b>\nClient: ${escapeHTML(bookingFields.clientName)} (${escapeHTML(String(b.clientPhone ?? ""))})\nService: ${escapeHTML(bookingFields.serviceName)}\n${escapeHTML(bookingFields.date)} at ${escapeHTML(bookingFields.timeSlot)}\nPaid: R${randFromCents(chargedCents)}\nReference: <code>${escapeHTML(reference)}</code>\nRefund manually in the Paystack dashboard.`,
@@ -1115,5 +1433,59 @@ export const paystackWebhook = onRequest(
       );
     }
     res.status(200).send("ok");
+  }
+);
+
+// --- B2 migration: backfill slot claims for existing bookings ---
+// One-off, idempotent, non-destructive: creates/overwrites CONFIRMED claims
+// for every future non-cancelled booking so pre-existing appointments block
+// slots the moment the claim-based availability goes live. Guarded by a
+// deploy-time secret because there is no admin session available headless;
+// safe to re-run any time (it only converges claims to booking truth).
+export const backfillSlotClaims = onRequest(
+  { secrets: [BACKFILL_TOKEN] },
+  async (req, res) => {
+    const auth = String(req.headers.authorization ?? "");
+    if (auth !== `Bearer ${BACKFILL_TOKEN.value()}`) {
+      res.status(401).send("unauthorized");
+      return;
+    }
+    // "Future" = today (UTC-24h, timezone-safe) onward.
+    const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000)
+      .toISOString()
+      .slice(0, 10);
+    const snap = await db
+      .collection("bookings")
+      .where("date", ">=", cutoff)
+      .get();
+    let backfilled = 0;
+    let skippedCancelled = 0;
+    const batch = db.batch();
+    for (const d of snap.docs) {
+      const bk = d.data() as any;
+      if (String(bk.status ?? "") === "Cancelled") {
+        skippedCancelled++;
+        continue;
+      }
+      const ids = cellIdsFor(
+        String(bk.date ?? ""),
+        String(bk.timeSlot ?? "00:00"),
+        Number(bk.durationMinutes) || 60
+      );
+      ids.forEach((id) => {
+        batch.set(db.doc(`slotClaims/${id}`), {
+          bookingRef: String(bk.paymentReference ?? "") || null,
+          bookingId: d.id,
+          status: "confirmed",
+          date: String(bk.date ?? ""),
+          time: id.slice(String(bk.date ?? "").length + 1),
+          expiresAt: null,
+          createdAt: FieldValue.serverTimestamp(),
+        });
+      });
+      backfilled++;
+    }
+    await batch.commit();
+    res.json({ ok: true, bookingsBackfilled: backfilled, skippedCancelled, scannedFrom: cutoff });
   }
 );
