@@ -85,9 +85,50 @@ const AdminLogin: React.FC = () => {
 
 // --- Dashboard Tabs ---
 
-const BookingsTab: React.FC = () => {
+const BookingsTab: React.FC<{ onOpenStatement?: () => void }> = ({ onOpenStatement }) => {
   const [bookings, setBookings] = useState<Booking[]>(api.getBookings());
   const [filter, setFilter] = useState('');
+  // Honest money figures, sourced from the SAME ledger fetch + reducer the
+  // Statement tab uses (deriveRow/addToTotals below) so the two screens can
+  // never disagree. Test rows are excluded, refunds subtract, anomalies and
+  // broken rows contribute nothing — identical rules to the Statement tab.
+  const [ledgerStats, setLedgerStats] = useState<{
+      collectedC: number;
+      anomalyCount: number;
+      paidBookingIds: Set<string>;
+  } | null>(null);
+  const [ledgerError, setLedgerError] = useState(false);
+
+  useEffect(() => {
+      let mounted = true;
+      const now = new Date();
+      api.getLedgerRows(startOfMonth(now), endOfMonth(now))
+          .then(ledger => {
+              if (!mounted) return;
+              const live = ledger.map(deriveRow).filter(r => r.row.mode !== 'test');
+              const t = zeroTotals();
+              live.forEach(r => addToTotals(t, r));
+              const paidBookingIds = new Set<string>();
+              live.forEach(r => {
+                  if (r.row.status === 'PAID_BOOKED' && r.row.bookingId) {
+                      paidBookingIds.add(r.row.bookingId);
+                  }
+              });
+              setLedgerStats({
+                  // Collected = what actually arrived and stayed: barber net
+                  // + owner cut (= charged minus Paystack fees), refunds
+                  // already subtracted by addToTotals.
+                  collectedC: t.barberNet + t.ownerCut,
+                  anomalyCount: live.filter(r => r.isAnomaly).length,
+                  paidBookingIds,
+              });
+          })
+          .catch(e => {
+              console.error('dashboard ledger fetch failed', e);
+              if (mounted) setLedgerError(true);
+          });
+      return () => { mounted = false; };
+  }, []);
 
   useEffect(() => {
       const unsubscribe = api.subscribe(() => {
@@ -167,17 +208,57 @@ const BookingsTab: React.FC = () => {
 
   const today = format(new Date(), 'yyyy-MM-dd');
   const todayBookings = bookings.filter(b => b.date === today && b.status === BookingStatus.CONFIRMED);
-  const revenue = bookings.filter(b => b.status === BookingStatus.CONFIRMED).reduce((acc, curr) => acc + curr.amount, 0);
+
+  // OUTSTANDING: confirmed live bookings with no matching paid ledger row —
+  // unpaid / pay-in-person money that has NOT been collected. Bookings paid
+  // outside the current month won't be in the month-scoped ledger fetch, so
+  // paymentStatus Paid/Refunded also counts as settled.
+  const outstandingC = bookings
+      .filter(b =>
+          b.status === BookingStatus.CONFIRMED &&
+          b.mode !== 'test' &&
+          !ledgerStats?.paidBookingIds.has(b.id) &&
+          b.paymentStatus !== PaymentStatus.PAID &&
+          b.paymentStatus !== PaymentStatus.REFUNDED)
+      .reduce((acc, b) => acc + Math.round((Number(b.amount) || 0) * 100), 0);
+
+  // UPCOMING: a COUNT of future confirmed bookings — not money until it is
+  // collected, so never rendered with an R prefix.
+  const nowMs = Date.now();
+  const upcomingCount = bookings.filter(b =>
+      b.status === BookingStatus.CONFIRMED &&
+      b.mode !== 'test' &&
+      new Date(`${b.date}T${b.timeSlot || '00:00'}`).getTime() >= nowMs
+  ).length;
 
   return (
     <div className="space-y-6 animate-in fade-in duration-500">
-      
-      {/* Stats Grid */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-        <Card className="p-5 flex flex-col justify-between bg-[#1C1C1E] text-white border-none shadow-lg shadow-black/10" noPadding>
+
+      {/* Stats Grid — sourced from the ledger, same rules as the Statement
+          tab. COLLECTED is the headline; "Total Revenue" (a sum of every
+          confirmed booking's amount, paid or not) was inflated and is gone. */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <Card className="p-5 flex flex-col justify-between bg-[#1C1C1E] text-white border-none shadow-lg shadow-black/10 col-span-2 md:col-span-1" noPadding>
             <div className="p-5">
-                <div className="text-white/60 text-[11px] font-bold uppercase tracking-wider mb-2">Total Revenue</div>
-                <div className="text-3xl font-bold tracking-tight">R{revenue}</div>
+                <div className="text-white/60 text-[11px] font-bold uppercase tracking-wider mb-2">Collected · This Month</div>
+                <div className="text-3xl font-bold tracking-tight">
+                    {ledgerError ? '—' : ledgerStats === null ? '…' : fmtRand(ledgerStats.collectedC)}
+                </div>
+                <div className="text-white/40 text-[10px] mt-1">Received after Paystack fees, refunds subtracted</div>
+            </div>
+        </Card>
+        <Card className="flex flex-col justify-between" noPadding>
+            <div className="p-5">
+                <div className="text-[#8E8E93] text-[11px] font-bold uppercase tracking-wider mb-2">Outstanding</div>
+                <div className="text-3xl font-bold text-[#FF9500] tracking-tight">{fmtRand(outstandingC)}</div>
+                <div className="text-[#8E8E93] text-[10px] mt-1">Confirmed but not paid</div>
+            </div>
+        </Card>
+        <Card className="flex flex-col justify-between" noPadding>
+            <div className="p-5">
+                <div className="text-[#8E8E93] text-[11px] font-bold uppercase tracking-wider mb-2">Upcoming</div>
+                <div className="text-3xl font-bold text-[#1C1C1E] tracking-tight">{upcomingCount}</div>
+                <div className="text-[#8E8E93] text-[10px] mt-1">Future confirmed bookings (count)</div>
             </div>
         </Card>
         <Card className="flex flex-col justify-between" noPadding>
@@ -186,13 +267,22 @@ const BookingsTab: React.FC = () => {
                 <div className="text-3xl font-bold text-[#1C1C1E] tracking-tight">{todayBookings.length}</div>
             </div>
         </Card>
-        <Card className="flex flex-col justify-between" noPadding>
-            <div className="p-5">
-                <div className="text-[#8E8E93] text-[11px] font-bold uppercase tracking-wider mb-2">Pending Payments</div>
-                <div className="text-3xl font-bold text-[#FF9500] tracking-tight">{bookings.filter(b => b.paymentStatus === PaymentStatus.PENDING).length}</div>
-            </div>
-        </Card>
       </div>
+
+      {ledgerStats !== null && ledgerStats.anomalyCount > 0 && (
+        <button
+            onClick={onOpenStatement}
+            className="w-full p-3 bg-[#FF3B30]/10 text-[#FF3B30] rounded-xl text-sm font-semibold flex items-center gap-2 hover:bg-[#FF3B30]/15 transition-colors"
+        >
+            <AlertTriangle size={16} />
+            {ledgerStats.anomalyCount} payment{ledgerStats.anomalyCount === 1 ? '' : 's'} this month did not resolve cleanly and {ledgerStats.anomalyCount === 1 ? 'is' : 'are'} NOT counted as collected — review the Statement tab.
+        </button>
+      )}
+      {ledgerError && (
+        <div className="p-3 bg-[#FF9500]/10 text-[#FF9500] rounded-xl text-sm font-medium">
+            Could not load the ledger — the Collected figure is unavailable (never estimated from bookings).
+        </div>
+      )}
 
       {/* Search & Action */}
       <div className="flex gap-3">
@@ -1104,7 +1194,7 @@ export const AdminPortal: React.FC = () => {
             </h2>
         </header>
 
-        {activeTab === 'bookings' && <BookingsTab />}
+        {activeTab === 'bookings' && <BookingsTab onOpenStatement={() => setActiveTab('statement')} />}
         {activeTab === 'statement' && <StatementTab />}
         {activeTab === 'services' && <ServicesTab />}
         {activeTab === 'settings' && <SettingsTab />}
