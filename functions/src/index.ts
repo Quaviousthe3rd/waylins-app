@@ -1,9 +1,18 @@
 import { setGlobalOptions } from "firebase-functions/v2";
 import { onRequest, onCall, HttpsError } from "firebase-functions/v2/https";
+import { onDocumentWritten } from "firebase-functions/v2/firestore";
 import { defineSecret } from "firebase-functions/params";
 import { initializeApp } from "firebase-admin/app";
 import { getFirestore, FieldValue, Timestamp } from "firebase-admin/firestore";
 import { createHmac, timingSafeEqual } from "crypto";
+import {
+  TELEGRAM_BOT_TOKEN,
+  TELEGRAM_CHAT_ID,
+  PaymentMode,
+  escapeHTML,
+  sendTelegram,
+  sendThrottledAlert,
+} from "./telegram";
 
 // All functions run in europe-west1.
 setGlobalOptions({ region: "europe-west1" });
@@ -11,15 +20,12 @@ setGlobalOptions({ region: "europe-west1" });
 initializeApp();
 const db = getFirestore();
 
-const TELEGRAM_BOT_TOKEN = defineSecret("TELEGRAM_BOT_TOKEN");
-const TELEGRAM_CHAT_ID = defineSecret("TELEGRAM_CHAT_ID");
 const PAYSTACK_SECRET_KEY = defineSecret("PAYSTACK_SECRET_KEY");
 const PAYSTACK_SECRET_KEY_TEST = defineSecret("PAYSTACK_SECRET_KEY_TEST");
 
 // --- Payment mode ---
 // settings/paymentConfig.mode switches the ENTIRE money path between
 // Paystack live and test integrations.
-type PaymentMode = "test" | "live";
 const secretKeyFor = (mode: PaymentMode): string =>
   mode === "test" ? PAYSTACK_SECRET_KEY_TEST.value() : PAYSTACK_SECRET_KEY.value();
 
@@ -50,7 +56,10 @@ interface ValidPaymentConfig {
 // visible in minutes, not sessions), and refuse to serve checkout.
 const paymentConfigError = async (detail: string): Promise<HttpsError> => {
   console.error(`PAYMENT_CONFIG_INVALID: ${detail}`);
-  await sendTelegram(
+  // Throttled: every page load re-triggers this, so identical alerts go out
+  // at most once per hour.
+  await sendThrottledAlert(
+    "cfg-invalid",
     `🚨 <b>Payment config invalid — checkout disabled</b>\n${escapeHTML(detail)}\nFix settings/paymentConfig. Online payment is refused until this is corrected.`
   );
   return new HttpsError(
@@ -74,7 +83,8 @@ const validatePaymentConfig = async (payCfg: any): Promise<ValidPaymentConfig> =
   if (unknown.length > 0) {
     const list = unknown.map((k) => JSON.stringify(k)).join(", ");
     console.warn(`PAYMENT_CONFIG_UNKNOWN_FIELDS: ${list}`);
-    await sendTelegram(
+    await sendThrottledAlert(
+      "cfg-unknown",
       `⚠️ <b>Unexpected field(s) on settings/paymentConfig</b>\n${escapeHTML(list)}\nPayments still work, but check for typos (a trailing space in a field name once silently broke checkout).`
     );
   }
@@ -575,35 +585,252 @@ export const cancelBooking = onCall(async (request) => {
   return { ok: true, bookingId };
 });
 
-// --- Telegram (server-side, NEW bot) ---
-// Sent only AFTER Firestore writes commit; a Telegram failure is logged and
-// never fails the webhook response.
-const sendTelegram = async (text: string): Promise<void> => {
-  try {
-    const resp = await fetch(
-      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN.value()}/sendMessage`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          chat_id: TELEGRAM_CHAT_ID.value(),
-          text,
-          parse_mode: "HTML",
-        }),
-      }
-    );
-    if (!resp.ok) {
-      console.error("Telegram API error", resp.status, await resp.text().catch(() => ""));
-    }
-  } catch (e) {
-    console.error("Telegram send failed (non-fatal)", e);
-  }
-};
+// --- Booking lifecycle trigger ---
+// The ONE owner of ALL booking lifecycle messages: created, cancelled,
+// rescheduled, payment status changed, deleted. Fires on every write to
+// bookings/{id} regardless of author (webhook, callable, admin portal, or a
+// manual Firebase-console edit — that universality is the point).
+//
+// HARD RULE: this trigger NEVER writes to bookings/ (it would re-trigger
+// itself forever). It writes only events/ rows — the audit trail behind the
+// messages. Event rows use a deterministic ID (bookingId + changeType +
+// commit time) so a retried trigger run skips the send instead of
+// duplicating it.
 
-const escapeHTML = (s: string): string =>
-  String(s ?? "").replace(/[&<>]/g, (m) =>
-    m === "&" ? "&amp;" : m === "<" ? "&lt;" : "&gt;"
+interface BookingChange {
+  type: string;
+  actor: string;
+  text: string;
+}
+
+export const onBookingWritten = onDocumentWritten(
+  {
+    document: "bookings/{bookingId}",
+    secrets: [TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID],
+  },
+  async (event) => {
+    const bookingId = event.params.bookingId;
+    const before = event.data?.before?.exists
+      ? (event.data.before.data() as any)
+      : null;
+    const after = event.data?.after?.exists
+      ? (event.data.after.data() as any)
+      : null;
+    if (!before && !after) return;
+
+    // Missing mode (pre-stamping docs) displays as live; this never feeds
+    // money logic.
+    const mode: PaymentMode = (after ?? before)?.mode === "test" ? "test" : "live";
+    // On delete, `after` is empty — details come from `before`.
+    const b = after ?? before;
+    const who = `${escapeHTML(String(b.clientName ?? ""))} (${escapeHTML(String(b.clientPhone ?? ""))})`;
+    const what = `Service: ${escapeHTML(String(b.serviceName ?? ""))}\nWhen: ${escapeHTML(String(b.date ?? ""))} at ${escapeHTML(String(b.timeSlot ?? ""))}`;
+    const ref = String(b.paymentReference ?? "");
+    const refLine = ref ? `\nRef: <code>${escapeHTML(ref)}</code>` : "";
+    const moneyHeld =
+      String(b.paymentStatus ?? "") === "Paid"
+        ? `\n💰 R${b.amount ?? "?"} was paid online and is STILL HELD — refund is a manual decision.`
+        : `\nPayment status: ${escapeHTML(String(b.paymentStatus ?? "unknown"))} — no money held.`;
+
+    // Only the specific changes below notify. Anything else (transactionId
+    // touch-ups, etc.) is silence, and silence is correct for noise.
+    const changes: BookingChange[] = [];
+
+    if (!before && after) {
+      const paid = String(after.paymentStatus ?? "") === "Paid";
+      changes.push({
+        type: "created",
+        actor: paid ? "server" : "admin",
+        text: paid
+          ? `✅ <b>New paid booking</b>\nClient: ${who}\n${what}\nAmount: R${after.amount ?? "?"}\nPayment: ${escapeHTML(String(after.paymentStatus ?? ""))}${refLine}`
+          : `🆕 <b>New booking (not paid online)</b>\nClient: ${who}\n${what}\nPayment: ${escapeHTML(String(after.paymentStatus ?? "unknown"))}`,
+      });
+    } else if (before && !after) {
+      changes.push({
+        type: "deleted",
+        actor: "admin",
+        text: `🗑️ <b>Booking deleted</b> (admin action)\nClient: ${who}\n${what}\nAmount: R${before.amount ?? "?"}${moneyHeld}${refLine}`,
+      });
+    } else if (before && after) {
+      if (
+        String(before.status ?? "") !== "Cancelled" &&
+        String(after.status ?? "") === "Cancelled"
+      ) {
+        const by = after.cancelledBy === "client" ? "client" : after.cancelledBy === "admin" ? "admin" : "unknown";
+        changes.push({
+          type: "cancelled",
+          actor: by,
+          text: `❌ <b>Booking cancelled by ${by}</b>\nClient: ${who}\n${what}\nAmount: R${after.amount ?? "?"}${moneyHeld}${refLine}`,
+        });
+      }
+      if (
+        String(before.date ?? "") !== String(after.date ?? "") ||
+        String(before.timeSlot ?? "") !== String(after.timeSlot ?? "")
+      ) {
+        // The reschedule callable stamps rescheduledFrom; a bare date edit
+        // (admin portal / console) does not.
+        const by = after.rescheduledFrom && !before.rescheduledFrom
+          ? "client"
+          : after.rescheduledFrom &&
+              JSON.stringify(after.rescheduledFrom) !== JSON.stringify(before.rescheduledFrom)
+            ? "client"
+            : "admin";
+        changes.push({
+          type: "rescheduled",
+          actor: by,
+          text: `🔄 <b>Booking rescheduled by ${by}</b>\nClient: ${who}\nService: ${escapeHTML(String(b.serviceName ?? ""))}\nFrom: ${escapeHTML(String(before.date ?? ""))} at ${escapeHTML(String(before.timeSlot ?? ""))}\nTo: ${escapeHTML(String(after.date ?? ""))} at ${escapeHTML(String(after.timeSlot ?? ""))}\nOriginal payment stays valid — no new charge.${refLine}`,
+        });
+      }
+      if (
+        String(before.paymentStatus ?? "") !== String(after.paymentStatus ?? "")
+      ) {
+        changes.push({
+          type: "payment_status_changed",
+          actor: "unknown",
+          text: `💰 <b>Payment status changed</b>\nClient: ${who}\n${what}\n${escapeHTML(String(before.paymentStatus ?? "?"))} → <b>${escapeHTML(String(after.paymentStatus ?? "?"))}</b>\nAmount: R${after.amount ?? "?"}${refLine}`,
+        });
+      }
+    }
+
+    if (changes.length === 0) return;
+
+    // Storm visibility: >5 events in 60s is worth a loud log line (a bulk
+    // admin action is fine; a runaway loop must not be silent).
+    try {
+      const recent = await db
+        .collection("events")
+        .where("createdAt", ">", Timestamp.fromMillis(Date.now() - 60_000))
+        .count()
+        .get();
+      if (recent.data().count >= 5) {
+        console.warn(
+          `NOTIFICATION_STORM: ${recent.data().count} booking events in the last 60s`
+        );
+      }
+    } catch (e) {
+      console.warn("event storm check failed (non-fatal)", e);
+    }
+
+    // event.time is the commit timestamp — stable across trigger retries,
+    // which is what makes the doc ID deterministic.
+    const stamp = String(event.time ?? "unknown").replace(/[^0-9A-Za-z]/g, "-");
+    for (const c of changes) {
+      const evRef = db.doc(`events/${bookingId}_${c.type}_${stamp}`);
+      try {
+        await evRef.create({
+          type: c.type,
+          bookingId,
+          reference: ref || null,
+          actor: c.actor,
+          before,
+          after,
+          mode,
+          createdAt: FieldValue.serverTimestamp(),
+        });
+      } catch (e: any) {
+        if (e?.code === 6 /* ALREADY_EXISTS: retried trigger run */) {
+          console.log(`event ${evRef.id} already recorded; skipping send`);
+          continue;
+        }
+        // Audit-row failure must not silence the human notification.
+        console.error("event row write failed; sending message anyway", e);
+      }
+      await sendTelegram(c.text, mode);
+    }
+  }
+);
+
+// --- Paystack refund events ---
+// refund.processed flips the ledger row to REFUNDED and the booking's
+// paymentStatus to Refunded (the bookings trigger then reports that status
+// change). refund.pending / refund.failed message only. A refund for a
+// reference we have no ledger row for is recorded as ORPHANED_PAYMENT and
+// flagged for manual attention.
+const handleRefundEvent = async (
+  eventType: string,
+  d: any,
+  eventMode: PaymentMode
+): Promise<void> => {
+  const reference = String(
+    d.transaction_reference ?? d.transaction?.reference ?? ""
   );
+  const amountRand = randFromCents(Number(d.amount) || 0);
+  const refLine = `Reference: <code>${escapeHTML(reference || "unknown")}</code>\nAmount: R${amountRand}`;
+
+  if (eventType === "refund.pending") {
+    await sendTelegram(`⏳ <b>Refund pending</b>\n${refLine}`, eventMode);
+    return;
+  }
+  if (eventType === "refund.failed") {
+    await sendTelegram(
+      `❌ <b>Refund FAILED — manual attention needed</b>\n${refLine}\nRetry or resolve in the Paystack dashboard.`,
+      eventMode
+    );
+    return;
+  }
+  if (eventType !== "refund.processed") {
+    return; // e.g. refund.processing — ack silently.
+  }
+
+  if (!reference) {
+    await sendTelegram(
+      `⚠️ <b>Refund processed with no reference — manual attention needed</b>\nAmount: R${amountRand}\nInvestigate in the Paystack dashboard.`,
+      eventMode
+    );
+    return;
+  }
+
+  const ledgerRef = db.doc(`ledger/${reference}`);
+  const ledgerSnap = await ledgerRef.get();
+
+  if (!ledgerSnap.exists) {
+    // Money moved on a transaction we have no record of.
+    try {
+      await ledgerRef.create({
+        reference,
+        mode: eventMode,
+        status: "ORPHANED_PAYMENT",
+        refundedAmount: amountRand,
+        event: { event: eventType, data: d },
+        createdAt: FieldValue.serverTimestamp(),
+      });
+    } catch (e: any) {
+      if (e?.code !== 6) throw e;
+    }
+    await sendTelegram(
+      `⚠️ <b>Orphaned refund — manual attention needed</b>\n${refLine}\nNo ledger row exists for this reference. Investigate in the Paystack dashboard.`,
+      eventMode
+    );
+    return;
+  }
+
+  if (ledgerSnap.data()?.status === "REFUNDED") {
+    return; // Replayed event: no duplicate message, no duplicate write.
+  }
+
+  await ledgerRef.set(
+    {
+      status: "REFUNDED",
+      refundedAmount: amountRand,
+      refundedAt: FieldValue.serverTimestamp(),
+    },
+    { merge: true }
+  );
+
+  const bookingId = ledgerSnap.data()?.bookingId;
+  if (bookingId) {
+    try {
+      await db.doc(`bookings/${bookingId}`).update({ paymentStatus: "Refunded" });
+    } catch (e) {
+      console.error(`could not set paymentStatus Refunded on ${bookingId}`, e);
+    }
+  }
+
+  await sendTelegram(
+    `💸 <b>Refund processed</b>\n${refLine}\nLedger updated to REFUNDED${bookingId ? "; booking payment status set to Refunded" : " (no linked booking)"}.`,
+    eventMode
+  );
+};
 
 // --- Paystack webhook ---
 // The single source of truth for paid bookings. Paystack POSTs events here;
@@ -648,9 +875,6 @@ export const paystackWebhook = onRequest(
       res.status(401).send("unauthorized");
       return;
     }
-    // Test events are visibly tagged everywhere they surface.
-    const tag = eventMode === "test" ? "[TEST] " : "";
-
     let event: any;
     try {
       event = JSON.parse(rawBody.toString("utf8"));
@@ -660,8 +884,32 @@ export const paystackWebhook = onRequest(
       return;
     }
 
-    // 2. Only charge.success does work; everything else is acked fast.
-    if (event?.event !== "charge.success") {
+    // 2. Route by event type. charge.success books; refunds and disputes
+    //    message the group (money at risk must never be silent); everything
+    //    else is acked fast without processing.
+    const eventType: string = String(event?.event ?? "");
+
+    if (eventType.startsWith("refund.") ) {
+      await handleRefundEvent(eventType, event.data ?? {}, eventMode);
+      res.status(200).send("ok");
+      return;
+    }
+    if (eventType.startsWith("charge.dispute.")) {
+      const d = event.data ?? {};
+      const disputeRef = String(d.transaction?.reference ?? d.transaction_reference ?? "unknown");
+      const disputeAmount = randFromCents(Number(d.amount ?? d.transaction?.amount) || 0);
+      const stage =
+        eventType === "charge.dispute.create" ? "🚨 <b>New dispute opened</b>"
+        : eventType === "charge.dispute.remind" ? "⏰ <b>Dispute reminder — response due</b>"
+        : "⚖️ <b>Dispute resolved</b>";
+      await sendTelegram(
+        `${stage}\nReference: <code>${escapeHTML(disputeRef)}</code>\nAmount: R${disputeAmount}\nStatus: ${escapeHTML(String(d.status ?? "unknown"))}\n⚠️ Money at risk — handle in the Paystack dashboard.`,
+        eventMode
+      );
+      res.status(200).send("ok");
+      return;
+    }
+    if (eventType !== "charge.success") {
       res.status(200).send("ok");
       return;
     }
@@ -710,7 +958,8 @@ export const paystackWebhook = onRequest(
         throw e;
       }
       await sendTelegram(
-        `${tag}⚠️ <b>Unmatched Paystack payment</b>\nReference: <code>${escapeHTML(reference)}</code>\nAmount: R${randFromCents(chargedCents)}\nNo pending booking found — investigate in the Paystack dashboard.`
+        `⚠️ <b>Unmatched Paystack payment — manual attention needed</b>\nReference: <code>${escapeHTML(reference)}</code>\nAmount: R${randFromCents(chargedCents)}\nNo pending booking found — investigate in the Paystack dashboard.`,
+        eventMode
       );
       res.status(200).send("ok");
       return;
@@ -739,7 +988,8 @@ export const paystackWebhook = onRequest(
         throw e;
       }
       await sendTelegram(
-        `${tag}🚨 <b>Paystack mode mismatch</b>\nReference: <code>${escapeHTML(reference)}</code>\nEvent env: ${eventMode} — booking intent env: ${intentMode}\nNo booking was created. Investigate immediately.`
+        `🚨 <b>Paystack mode mismatch — manual attention needed</b>\nReference: <code>${escapeHTML(reference)}</code>\nEvent env: ${eventMode} — booking intent env: ${intentMode}\nNo booking was created. Investigate immediately.`,
+        eventMode
       );
       res.status(200).send("ok");
       return;
@@ -772,7 +1022,8 @@ export const paystackWebhook = onRequest(
         throw e;
       }
       await sendTelegram(
-        `${tag}⚠️ <b>Paystack amount mismatch</b>\nReference: <code>${escapeHTML(reference)}</code>\nCharged: R${randFromCents(chargedCents)} — expected R${randFromCents(Number(amounts.amountCents) || 0)}\nClient: ${escapeHTML(bookingFields.clientName)}\nNo booking was created. Review and refund/adjust manually.`
+        `⚠️ <b>Paystack amount mismatch — manual attention needed</b>\nReference: <code>${escapeHTML(reference)}</code>\nCharged: R${randFromCents(chargedCents)} — expected R${randFromCents(Number(amounts.amountCents) || 0)}\nClient: ${escapeHTML(bookingFields.clientName)}\nNo booking was created. Review and refund/adjust manually.`,
+        eventMode
       );
       res.status(200).send("ok");
       return;
@@ -852,13 +1103,15 @@ export const paystackWebhook = onRequest(
     }
 
     // 7. Telegram AFTER the writes; failure is logged only.
+    //    NOTE: the happy path sends NOTHING here — the bookings/{id}
+    //    Firestore trigger (onBookingWritten) owns the "new paid booking"
+    //    message now. Sending here too would notify every booking twice.
+    //    SLOT_TAKEN_REFUND writes no booking doc, so the webhook still owns
+    //    that alert.
     if (slotTaken) {
       await sendTelegram(
-        `${tag}🔴 <b>Paid but slot taken — refund needed</b>\nClient: ${escapeHTML(bookingFields.clientName)} (${escapeHTML(String(b.clientPhone ?? ""))})\nService: ${escapeHTML(bookingFields.serviceName)}\n${escapeHTML(bookingFields.date)} at ${escapeHTML(bookingFields.timeSlot)}\nPaid: R${randFromCents(chargedCents)}\nReference: <code>${escapeHTML(reference)}</code>\nRefund manually in the Paystack dashboard.`
-      );
-    } else {
-      await sendTelegram(
-        `${tag}✅ <b>New paid booking</b>\nClient: ${escapeHTML(bookingFields.clientName)} (${escapeHTML(String(b.clientPhone ?? ""))})\nService: ${escapeHTML(bookingFields.serviceName)}\nWhen: ${escapeHTML(bookingFields.date)} at ${escapeHTML(bookingFields.timeSlot)}\nAmount: R${randFromCents(chargedCents)}\nRef: <code>${escapeHTML(reference)}</code>`
+        `🔴 <b>Paid but slot taken — refund needed</b>\nClient: ${escapeHTML(bookingFields.clientName)} (${escapeHTML(String(b.clientPhone ?? ""))})\nService: ${escapeHTML(bookingFields.serviceName)}\n${escapeHTML(bookingFields.date)} at ${escapeHTML(bookingFields.timeSlot)}\nPaid: R${randFromCents(chargedCents)}\nReference: <code>${escapeHTML(reference)}</code>\nRefund manually in the Paystack dashboard.`,
+        eventMode
       );
     }
     res.status(200).send("ok");

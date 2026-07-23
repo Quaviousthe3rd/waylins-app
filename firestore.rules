@@ -47,6 +47,18 @@ service cloud.firestore {
       allow update, delete: if isAdmin();
     }
 
+    // events: booking lifecycle audit trail, written ONLY by the
+    // onBookingWritten trigger (Admin SDK). Admin may read; no client writes.
+    match /events/{id} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+
+    // alertThrottle: server-side alert rate-limit bookkeeping. Server only.
+    match /alertThrottle/{key} {
+      allow read, write: if false;
+    }
+
     // Everything else: deny.
     match /{document=**} {
       allow read, write: if false;
