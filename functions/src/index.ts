@@ -1,6 +1,7 @@
 import { setGlobalOptions } from "firebase-functions/v2";
 import { onRequest, onCall, HttpsError } from "firebase-functions/v2/https";
 import { onDocumentWritten } from "firebase-functions/v2/firestore";
+import { onSchedule } from "firebase-functions/v2/scheduler";
 import { defineSecret } from "firebase-functions/params";
 import { initializeApp } from "firebase-admin/app";
 import { getFirestore, FieldValue, Timestamp } from "firebase-admin/firestore";
@@ -13,6 +14,16 @@ import {
   sendTelegram,
   sendThrottledAlert,
 } from "./telegram";
+import {
+  settleCharge,
+  randFromCents,
+  DATE_RE,
+  TIME_RE,
+  toMinutes,
+  overlaps,
+  cellIdsFor,
+  claimBlocks,
+} from "./settlement";
 
 // All functions run in europe-west1.
 setGlobalOptions({ region: "europe-west1" });
@@ -186,21 +197,6 @@ const computeQuote = (baseCents: number, cfg: FeeConfig): Quote => {
   };
 };
 
-const randFromCents = (c: number): number => c / 100;
-
-const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
-const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
-
-const toMinutes = (hhmm: string): number => {
-  const [h, m] = hhmm.split(":").map(Number);
-  return h * 60 + m;
-};
-
-// Same semantics as date-fns areIntervalsOverlapping (exclusive bounds):
-// touching end-to-start is NOT an overlap.
-const overlaps = (aStart: number, aEnd: number, bStart: number, bEnd: number) =>
-  aStart < bEnd && bStart < aEnd;
-
 // --- Slot claims (B2: atomic double-booking prevention) ---
 // slotClaims/{date}_{HH:mm}: one doc per 30-minute grid cell. A booking that
 // spans several cells claims ALL of them. Claims are created "held" (expire
@@ -211,48 +207,6 @@ const overlaps = (aStart: number, aEnd: number, bStart: number, bEnd: number) =>
 // Telegram or other side effects inside transaction bodies): Firestore
 // retries transactions on contention.
 const HOLD_MS = 15 * 60 * 1000;
-
-// Cells are computed by flooring the start to the 30-min grid and covering
-// through ceil(end), so even an off-grid legacy timeSlot maps onto the same
-// cells a grid-aligned booking would claim.
-const cellIdsFor = (
-  date: string,
-  timeSlot: string,
-  durationMinutes: number
-): string[] => {
-  const start = toMinutes(timeSlot);
-  const end = start + Math.max(1, durationMinutes);
-  const first = Math.floor(start / 30);
-  const last = Math.ceil(end / 30); // exclusive
-  const ids: string[] = [];
-  for (let c = first; c < last; c++) {
-    const m = c * 30;
-    const hh = String(Math.floor(m / 60)).padStart(2, "0");
-    const mm = String(m % 60).padStart(2, "0");
-    ids.push(`${date}_${hh}:${mm}`);
-  }
-  return ids;
-};
-
-// A claim blocks unless it belongs to us (by reference or bookingId) or it
-// is a held claim that has already expired (server clock).
-const claimBlocks = (
-  snap: FirebaseFirestore.DocumentSnapshot,
-  nowMs: number,
-  ownRef?: string | null,
-  ownBookingId?: string | null
-): boolean => {
-  if (!snap.exists) return false;
-  const c = snap.data() as any;
-  if (ownRef && c.bookingRef === ownRef) return false;
-  if (ownBookingId && c.bookingId === ownBookingId) return false;
-  if (c.status === "confirmed") return true;
-  if (c.status === "held") {
-    const exp = c.expiresAt?.toMillis?.();
-    return typeof exp === "number" && exp > nowMs;
-  }
-  return false;
-};
 
 const makeReference = (): string => {
   const rand = Array.from({ length: 8 }, () =>
@@ -307,13 +261,16 @@ export const initTransaction = onCall(
       throw new HttpsError("failed-precondition", "Service has an invalid price.");
     }
 
-    // 2b. Lazy cleanup: delete pendingPayments older than 30 minutes.
-    //     Runs on every init, so no scheduler is needed. Abandoned intents
-    //     never blocked slots anyway (only bookings do), but this keeps the
-    //     collection from growing without bound. Best-effort: a cleanup
-    //     failure must never block a paying customer.
+    // 2b. Lazy cleanup: delete pendingPayments older than 48 HOURS.
+    //     Booking intent detail must outlive any plausible webhook outage —
+    //     a 30-minute TTL once garbage-collected a paid booking's details
+    //     before its webhook arrived (the orphan incident). 48h matches the
+    //     reconciliation sweep's lookback window, so an intent always
+    //     survives long enough for the sweep to settle it. Slot claims keep
+    //     their separate 15-minute hold — that is a different concern.
+    //     Best-effort: a cleanup failure must never block a paying customer.
     try {
-      const cutoff = Timestamp.fromMillis(Date.now() - 30 * 60 * 1000);
+      const cutoff = Timestamp.fromMillis(Date.now() - 48 * 60 * 60 * 1000);
       const stale = await db
         .collection("pendingPayments")
         .where("createdAt", "<", cutoff)
@@ -1186,250 +1143,210 @@ export const paystackWebhook = onRequest(
       return;
     }
 
-    const ledgerRef = db.doc(`ledger/${reference}`);
-    const chargedCents = Number(data.amount) || 0;
-    const paystackFeeActualRand =
-      data.fees != null ? randFromCents(Number(data.fees) || 0) : null;
-
-    // Base ledger fields shared by every outcome. The raw event is stored
-    // verbatim for reconciliation. `mode` is stamped on EVERY row: rows with
-    // mode "test" must be excluded from all revenue/statement totals.
-    const ledgerBase = {
-      reference,
-      mode: eventMode,
-      transactionId: data.id != null ? String(data.id) : null,
-      charged: randFromCents(chargedCents),
-      paystackFeeActual: paystackFeeActualRand,
-      event,
-      createdAt: FieldValue.serverTimestamp(),
-    };
-
-    // 3. Idempotency fast-path (the transaction below also enforces this
-    //    atomically via tx.create()).
-    if ((await ledgerRef.get()).exists) {
-      res.status(200).send("ok");
-      return;
-    }
-
-    const pendingSnap = await db.doc(`pendingPayments/${reference}`).get();
-
-    // 4. Money arrived with no matching intent: record it, alert, ack.
-    if (!pendingSnap.exists) {
-      console.error(`charge.success for unknown reference ${reference}`);
-      try {
-        await ledgerRef.create({ ...ledgerBase, status: "UNMATCHED_PAYMENT" });
-      } catch (e: any) {
-        if (e?.code === 6 /* ALREADY_EXISTS */) { res.status(200).send("ok"); return; }
-        throw e;
-      }
-      await sendTelegram(
-        `⚠️ <b>Unmatched Paystack payment — manual attention needed</b>\nReference: <code>${escapeHTML(reference)}</code>\nAmount: R${randFromCents(chargedCents)}\nNo pending booking found — investigate in the Paystack dashboard.`,
-        eventMode
-      );
-      res.status(200).send("ok");
-      return;
-    }
-
-    const pending = pendingSnap.data() as any;
-
-    // 4b. Cross-mode guard: an event may only settle an intent created in
-    //     the SAME environment. A test-signed charge (free test cards) must
-    //     never confirm a live booking intent — that would be a payment
-    //     bypass. Record, alert, ack; never book.
-    const intentMode: PaymentMode = pending.mode === "test" ? "test" : "live";
-    if (intentMode !== eventMode) {
-      console.error(
-        `MODE_MISMATCH ${reference}: event is ${eventMode}, intent is ${intentMode}`
-      );
-      try {
-        await ledgerRef.create({
-          ...ledgerBase,
-          bookingId: null,
-          status: "MODE_MISMATCH",
-          intentMode,
-        });
-      } catch (e: any) {
-        if (e?.code === 6) { res.status(200).send("ok"); return; }
-        throw e;
-      }
-      await sendTelegram(
-        `🚨 <b>Paystack mode mismatch — manual attention needed</b>\nReference: <code>${escapeHTML(reference)}</code>\nEvent env: ${eventMode} — booking intent env: ${intentMode}\nNo booking was created. Investigate immediately.`,
-        eventMode
-      );
-      res.status(200).send("ok");
-      return;
-    }
-
-    const b = pending.booking ?? {};
-    const amounts = pending.amounts ?? {};
-    const bookingFields = {
-      clientName: String(b.clientName ?? ""),
-      serviceName: String(b.serviceName ?? ""),
-      date: String(b.date ?? ""),
-      timeSlot: String(b.timeSlot ?? ""),
-    };
-    const ledgerFull = {
-      ...ledgerBase,
-      ...bookingFields,
-      estimatedFee: amounts.estimatedFeeRand ?? null,
-      barberNet: amounts.barberNetRand ?? null,
-    };
-
-    // 5. The charge must match the quoted amount EXACTLY (integer cents).
-    if (chargedCents !== Number(amounts.amountCents)) {
-      console.error(
-        `AMOUNT_MISMATCH ${reference}: charged ${chargedCents}, expected ${amounts.amountCents}`
-      );
-      try {
-        await ledgerRef.create({ ...ledgerFull, bookingId: null, status: "AMOUNT_MISMATCH" });
-      } catch (e: any) {
-        if (e?.code === 6) { res.status(200).send("ok"); return; }
-        throw e;
-      }
-      await sendTelegram(
-        `⚠️ <b>Paystack amount mismatch — manual attention needed</b>\nReference: <code>${escapeHTML(reference)}</code>\nCharged: R${randFromCents(chargedCents)} — expected R${randFromCents(Number(amounts.amountCents) || 0)}\nClient: ${escapeHTML(bookingFields.clientName)}\nNo booking was created. Review and refund/adjust manually.`,
-        eventMode
-      );
-      res.status(200).send("ok");
-      return;
-    }
-
-    // 6. Happy path — one Firestore transaction:
-    //    - re-check the slot (someone may have booked between init & webhook)
-    //    - create the ledger row (tx.create = atomic idempotency)
-    //    - write the booking ONLY if the slot is still free
-    //    Money is never silently dropped: a lost race becomes a
-    //    SLOT_TAKEN_REFUND ledger row + Telegram alert for a manual refund.
-    const bookingRef = db.collection("bookings").doc();
-    const durationMinutes = Number(b.durationMinutes) || 60;
-    const slotStart = toMinutes(String(b.timeSlot ?? "00:00"));
-    const slotEnd = slotStart + durationMinutes;
-
-    let slotTaken = false;
-    let orphaned = false;
-    const cellIds = cellIdsFor(String(b.date ?? ""), String(b.timeSlot ?? "00:00"), durationMinutes);
-    const cellRefs = cellIds.map((id) => db.doc(`slotClaims/${id}`));
+    // 3–7. Settle via the SHARED settlement core (settlement.ts) — the same
+    //      function the reconciliation sweep and admin manual settle call,
+    //      so the paths can never diverge. Idempotent on the reference.
     try {
-      await db.runTransaction(async (tx) => {
-        slotTaken = false;
-        orphaned = false;
-        // All reads first (Firestore transaction rule), then writes.
-        const cellSnaps = await tx.getAll(...cellRefs);
-        const sameDay = await tx.get(
-          db.collection("bookings").where("date", "==", b.date)
-        );
-        const nowMs = Date.now();
-        // Our held claim may have expired and been stolen between init and
-        // webhook. Missing/expired cells we simply re-claim; a cell that is
-        // confirmed or held-unexpired by ANOTHER reference means the slot is
-        // gone — money must not vanish: ORPHANED_PAYMENT + manual refund.
-        const stolen = cellSnaps.some((s) => claimBlocks(s, nowMs, reference));
-        const taken = sameDay.docs.some((d) => {
-          const other = d.data();
-          if (other.status === "Cancelled") return false;
-          const oStart = toMinutes(String(other.timeSlot ?? "00:00"));
-          const oEnd = oStart + (Number(other.durationMinutes) || 60);
-          return overlaps(slotStart, slotEnd, oStart, oEnd);
-        });
-
-        // Whenever we cannot book, drop any cells still held by us so the
-        // slot is not wedged for the winner's neighbours.
-        const releaseOwnCells = () => {
-          cellSnaps.forEach((s, i) => {
-            if (s.exists && (s.data() as any).bookingRef === reference) {
-              tx.delete(cellRefs[i]);
-            }
-          });
-        };
-
-        if (stolen) {
-          orphaned = true;
-          releaseOwnCells();
-          tx.create(ledgerRef, {
-            ...ledgerFull,
-            bookingId: null,
-            status: "ORPHANED_PAYMENT",
-          });
-        } else if (taken) {
-          slotTaken = true;
-          releaseOwnCells();
-          tx.create(ledgerRef, {
-            ...ledgerFull,
-            bookingId: null,
-            status: "SLOT_TAKEN_REFUND",
-          });
-        } else {
-          tx.create(ledgerRef, {
-            ...ledgerFull,
-            bookingId: bookingRef.id,
-            status: "PAID_BOOKED",
-          });
-          tx.set(bookingRef, {
-            id: bookingRef.id,
-            // Test bookings are stamped so they can be filtered out of any
-            // revenue/statement totals alongside their ledger rows.
-            mode: eventMode,
-            clientName: bookingFields.clientName,
-            clientPhone: String(b.clientPhone ?? ""),
-            date: bookingFields.date,
-            timeSlot: bookingFields.timeSlot,
-            serviceId: String(b.serviceId ?? ""),
-            serviceName: bookingFields.serviceName,
-            durationMinutes,
-            amount: amounts.totalRand ?? randFromCents(chargedCents),
-            depositAmount: amounts.totalRand ?? randFromCents(chargedCents),
-            paymentMethod: "Online (Paystack)",
-            paymentStatus: "Paid",
-            status: "Confirmed",
-            createdAt: new Date().toISOString(),
-            paymentReference: reference,
-            transactionId: data.id != null ? String(data.id) : "",
-          });
-          // Flip the reference's cells to confirmed in the SAME transaction
-          // that writes the booking.
-          cellRefs.forEach((ref, i) => {
-            tx.set(ref, {
-              bookingRef: reference,
-              bookingId: bookingRef.id,
-              status: "confirmed",
-              date: String(b.date ?? ""),
-              time: cellIds[i].slice(String(b.date ?? "").length + 1),
-              expiresAt: null,
-              createdAt: FieldValue.serverTimestamp(),
-            });
-          });
-        }
-        tx.delete(pendingSnap.ref);
-      });
-    } catch (e: any) {
-      if (e?.code === 6 /* ALREADY_EXISTS: concurrent retry won the race */) {
-        res.status(200).send("ok");
-        return;
-      }
+      await settleCharge(data, eventMode, "webhook", event);
+    } catch (e) {
       // Genuine write failure: 500 so Paystack retries later.
-      console.error(`webhook transaction failed for ${reference}`, e);
+      console.error(`webhook settlement failed for ${reference}`, e);
       res.status(500).send("error");
       return;
     }
-
-    // 7. Telegram AFTER the writes; failure is logged only.
-    //    NOTE: the happy path sends NOTHING here — the bookings/{id}
-    //    Firestore trigger (onBookingWritten) owns the "new paid booking"
-    //    message now. Sending here too would notify every booking twice.
-    //    SLOT_TAKEN_REFUND writes no booking doc, so the webhook still owns
-    //    that alert.
-    if (orphaned) {
-      await sendTelegram(
-        `🔴 <b>Orphaned payment — slot claim was stolen, refund needed</b>\nClient: ${escapeHTML(bookingFields.clientName)} (${escapeHTML(String(b.clientPhone ?? ""))})\nService: ${escapeHTML(bookingFields.serviceName)}\n${escapeHTML(bookingFields.date)} at ${escapeHTML(bookingFields.timeSlot)}\nPaid: R${randFromCents(chargedCents)}\nReference: <code>${escapeHTML(reference)}</code>\nTheir hold expired and someone else claimed the slot before payment landed. No booking was created — refund manually in the Paystack dashboard.`,
-        eventMode
-      );
-    }
-    if (slotTaken) {
-      await sendTelegram(
-        `🔴 <b>Paid but slot taken — refund needed</b>\nClient: ${escapeHTML(bookingFields.clientName)} (${escapeHTML(String(b.clientPhone ?? ""))})\nService: ${escapeHTML(bookingFields.serviceName)}\n${escapeHTML(bookingFields.date)} at ${escapeHTML(bookingFields.timeSlot)}\nPaid: R${randFromCents(chargedCents)}\nReference: <code>${escapeHTML(reference)}</code>\nRefund manually in the Paystack dashboard.`,
-        eventMode
-      );
-    }
     res.status(200).send("ok");
+  }
+);
+
+// --- D1: Scheduled reconciliation sweep ---
+// Every 15 minutes: ask Paystack for successful transactions in the last
+// 48 hours (current mode's key) and settle any that have no ledger row,
+// via the SAME settleCharge the webhook uses. This makes webhook delivery
+// non-critical: Paystack is the source of truth and the system self-heals.
+// A healthy system sweeps up nothing — anything settled here means webhook
+// delivery is failing, so every sweep settlement alerts Telegram.
+//
+// Cost: 96 invocations/day of a mostly-idle function + one Cloud Scheduler
+// job (first 3 are free) — effectively R0 at this volume.
+export const reconcileSweep = onSchedule(
+  {
+    schedule: "every 15 minutes",
+    timeZone: "Africa/Johannesburg",
+    secrets: [
+      PAYSTACK_SECRET_KEY,
+      PAYSTACK_SECRET_KEY_TEST,
+      TELEGRAM_BOT_TOKEN,
+      TELEGRAM_CHAT_ID,
+    ],
+  },
+  async () => {
+    // Respect the current mode; an invalid config alerts (throttled, the
+    // sweep re-fires every 15 min) and skips — never guesses live.
+    const payCfg = (await db.doc("settings/paymentConfig").get()).data();
+    const mode: PaymentMode | null =
+      payCfg?.mode === "test" ? "test" : payCfg?.mode === "live" ? "live" : null;
+    if (!mode) {
+      console.error("reconcileSweep: paymentConfig mode invalid; skipping");
+      await sendThrottledAlert(
+        "sweep-cfg",
+        `🚨 <b>Reconciliation sweep cannot run</b>\nsettings/paymentConfig mode is invalid — the orphan-payment safety net is OFF until this is fixed.`
+      );
+      return;
+    }
+
+    // Successful transactions in the last 48h, paginated (100/page).
+    const from = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+    const txns: any[] = [];
+    for (let page = 1; page <= 10; page++) {
+      const resp = await fetch(
+        `https://api.paystack.co/transaction?status=success&perPage=100&page=${page}&from=${encodeURIComponent(from)}`,
+        { headers: { Authorization: `Bearer ${secretKeyFor(mode)}` } }
+      );
+      const body: any = await resp.json().catch(() => null);
+      if (!resp.ok || !body?.status) {
+        console.error("reconcileSweep: Paystack list failed", resp.status, body?.message);
+        await sendThrottledAlert(
+          "sweep-api",
+          `⚠️ <b>Reconciliation sweep could not reach Paystack</b>\n${escapeHTML(String(body?.message ?? `HTTP ${resp.status}`))}\nThe sweep will retry in 15 minutes.`,
+          mode
+        );
+        return;
+      }
+      const list: any[] = body.data ?? [];
+      txns.push(...list);
+      if (list.length < 100) break;
+    }
+
+    let settled = 0;
+    for (const t of txns) {
+      const reference = String(t.reference ?? "");
+      if (!reference) continue;
+      // Skip anything already settled (by the webhook or a previous sweep).
+      if ((await db.doc(`ledger/${reference}`).get()).exists) continue;
+      try {
+        const result = await settleCharge(t, mode, "sweep", {
+          event: "charge.success",
+          data: t,
+          via: "reconcileSweep",
+        });
+        if (result.status === "ALREADY_SETTLED") continue; // webhook won the race — fine
+        settled++;
+        // Anomaly outcomes already alerted inside settleCharge; this alert
+        // is about the SWEEP having had to act at all — webhook delivery is
+        // failing and someone needs to know.
+        await sendTelegram(
+          `🧹 <b>Reconciliation sweep settled a payment the webhook missed</b>\nReference: <code>${escapeHTML(reference)}</code>\nOutcome: ${escapeHTML(result.status)}${result.clientName ? `\nClient: ${escapeHTML(result.clientName)}` : ""}\nAmount: R${result.amountRand}${result.recoveredFromMetadata ? "\nBooking rebuilt from Paystack metadata (pending intent was gone)." : ""}\n⚠️ A healthy system sweeps up nothing — check webhook delivery in the Paystack dashboard.`,
+          mode
+        );
+      } catch (e) {
+        console.error(`reconcileSweep: settle failed for ${reference}`, e);
+        await sendThrottledAlert(
+          "sweep-settle-fail",
+          `⚠️ <b>Reconciliation sweep failed to settle</b>\nReference: <code>${escapeHTML(reference)}</code>\nIt will retry in 15 minutes; if this repeats, investigate the logs.`,
+          mode
+        );
+      }
+    }
+    console.log(
+      `reconcileSweep(${mode}): ${txns.length} successful txns in window, ${settled} settled by sweep`
+    );
+  }
+);
+
+// --- D3: Admin manual settle ---
+// The human escape hatch when both the webhook and the sweep fail. Two
+// phases so the admin confirms rather than fires blind:
+//   confirm:false → verify the reference against Paystack and return what
+//                   was found (amount, client, mode, ledger state). WRITES
+//                   NOTHING.
+//   confirm:true  → settle via the SAME shared settleCharge as the webhook
+//                   and the sweep. Idempotent on the reference.
+// Admin-only: requires Firebase Auth (only admins can sign in).
+export const manualSettle = onCall(
+  {
+    secrets: [
+      PAYSTACK_SECRET_KEY,
+      PAYSTACK_SECRET_KEY_TEST,
+      TELEGRAM_BOT_TOKEN,
+      TELEGRAM_CHAT_ID,
+    ],
+  },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "Admin sign-in required.");
+    }
+    const { reference, confirm } = request.data ?? {};
+    if (typeof reference !== "string" || !/^[\w-]{4,100}$/.test(reference.trim())) {
+      throw new HttpsError("invalid-argument", "A valid reference is required.");
+    }
+    const ref = reference.trim();
+
+    // Verify against Paystack: current mode's environment first, then the
+    // other, so a test reference is still findable while mode is live (and
+    // vice versa). Whichever environment finds it is the settle mode.
+    const payCfg = (await db.doc("settings/paymentConfig").get()).data();
+    const cfgMode: PaymentMode = payCfg?.mode === "test" ? "test" : "live";
+    const tryModes: PaymentMode[] = cfgMode === "test" ? ["test", "live"] : ["live", "test"];
+    let found: any = null;
+    let foundMode: PaymentMode | null = null;
+    for (const m of tryModes) {
+      const resp = await fetch(
+        `https://api.paystack.co/transaction/verify/${encodeURIComponent(ref)}`,
+        { headers: { Authorization: `Bearer ${secretKeyFor(m)}` } }
+      );
+      const body: any = await resp.json().catch(() => null);
+      if (resp.ok && body?.status && body?.data) {
+        found = body.data;
+        foundMode = m;
+        break;
+      }
+    }
+    if (!found || !foundMode) {
+      throw new HttpsError(
+        "not-found",
+        "Paystack has no transaction for that reference (checked both live and test)."
+      );
+    }
+
+    const ledgerExists = (await db.doc(`ledger/${ref}`).get()).exists;
+    const pendingExists = (await db.doc(`pendingPayments/${ref}`).get()).exists;
+    const md = found.metadata ?? {};
+    const preview = {
+      reference: ref,
+      env: foundMode,
+      paystackStatus: String(found.status ?? "unknown"),
+      amountRand: randFromCents(Number(found.amount) || 0),
+      paidAt: found.paid_at ?? null,
+      channel: found.channel ?? null,
+      clientName: md.clientName ?? null,
+      clientPhone: md.clientPhone ?? null,
+      serviceName: md.serviceName ?? null,
+      date: md.date ?? null,
+      timeSlot: md.timeSlot ?? null,
+      ledgerExists,
+      pendingExists,
+    };
+
+    if (!confirm) return { preview };
+
+    if (preview.paystackStatus !== "success") {
+      throw new HttpsError(
+        "failed-precondition",
+        `Transaction status is "${preview.paystackStatus}" — only successful charges can be settled.`
+      );
+    }
+    const result = await settleCharge(found, foundMode, "manual", {
+      event: "charge.success",
+      data: found,
+      via: "manualSettle",
+      by: request.auth.uid,
+    });
+    if (result.status !== "ALREADY_SETTLED") {
+      await sendTelegram(
+        `🛠️ <b>Admin manually settled a payment</b>\nReference: <code>${escapeHTML(ref)}</code>\nOutcome: ${escapeHTML(result.status)}\nAmount: R${result.amountRand}${result.recoveredFromMetadata ? "\nBooking rebuilt from Paystack metadata." : ""}`,
+        foundMode
+      );
+    }
+    return { preview, result };
   }
 );

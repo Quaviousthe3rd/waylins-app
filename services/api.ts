@@ -178,6 +178,33 @@ export interface LedgerRow {
     createdAt: Date | null;   // transaction time (webhook processing time)
 }
 
+// What the manualSettle callable found on Paystack for a reference —
+// shown to the admin BEFORE anything is written.
+export interface ManualSettlePreview {
+    reference: string;
+    env: 'test' | 'live';
+    paystackStatus: string;
+    amountRand: number;
+    paidAt: string | null;
+    channel: string | null;
+    clientName: string | null;
+    clientPhone: string | null;
+    serviceName: string | null;
+    date: string | null;
+    timeSlot: string | null;
+    ledgerExists: boolean;
+    pendingExists: boolean;
+}
+
+export interface ManualSettleResult {
+    status: string;           // PAID_BOOKED | ALREADY_SETTLED | anomalies
+    reference: string;
+    bookingId: string | null;
+    recoveredFromMetadata: boolean;
+    amountRand: number;
+    clientName: string | null;
+}
+
 // --- API IMPLEMENTATION ---
 
 export const api = {
@@ -275,6 +302,25 @@ export const api = {
       const functions = getFunctions(firebaseApp, 'europe-west1');
       const call = httpsCallable(functions, 'cancelBooking');
       await call({ bookingId, clientPhone });
+  },
+
+  // Admin manual settle (Phase D layer 3). Two-phase: verify first (writes
+  // nothing, returns what Paystack knows), then settle on explicit confirm
+  // via the same server-side settlement path as the webhook and sweep.
+  manualSettleVerify: async (reference: string): Promise<ManualSettlePreview> => {
+      if (!firebaseApp) throw new Error('Database not connected.');
+      const functions = getFunctions(firebaseApp, 'europe-west1');
+      const call = httpsCallable(functions, 'manualSettle');
+      const result: any = await call({ reference, confirm: false });
+      return result?.data?.preview as ManualSettlePreview;
+  },
+
+  manualSettleConfirm: async (reference: string): Promise<ManualSettleResult> => {
+      if (!firebaseApp) throw new Error('Database not connected.');
+      const functions = getFunctions(firebaseApp, 'europe-west1');
+      const call = httpsCallable(functions, 'manualSettle');
+      const result: any = await call({ reference, confirm: true });
+      return result?.data?.result as ManualSettleResult;
   },
 
   // Wait for the webhook-created booking to appear (paymentReference match).

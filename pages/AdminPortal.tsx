@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Link } from 'react-router-dom';
-import { api, LedgerRow } from '../services/api';
+import { api, LedgerRow, ManualSettlePreview } from '../services/api';
 import { Booking, ServiceItem, BookingStatus, PaymentStatus, Blockout } from '../types';
 import { Button } from '../components/ui/Button';
 import { Card } from '../components/ui/Card';
@@ -809,6 +809,115 @@ const addToTotals = (t: Totals, r: StatementRow): void => {
     t.barberNet += sign * (r.barberNetC ?? 0);
 };
 
+// --- Manual settle (Phase D layer 3) ---
+// The human escape hatch when both the webhook and the reconciliation sweep
+// fail. Two-phase on purpose: Verify shows exactly what Paystack has for
+// the reference BEFORE anything is written; only an explicit Settle click
+// writes, via the same server-side settlement path as the webhook.
+const ManualSettleCard: React.FC<{ onSettled: () => void }> = ({ onSettled }) => {
+    const [reference, setReference] = useState('');
+    const [preview, setPreview] = useState<ManualSettlePreview | null>(null);
+    const [busy, setBusy] = useState<'verify' | 'settle' | null>(null);
+    const [error, setError] = useState<string | null>(null);
+    const [outcome, setOutcome] = useState<string | null>(null);
+
+    const reset = () => { setPreview(null); setError(null); setOutcome(null); };
+
+    const verify = async () => {
+        reset();
+        setBusy('verify');
+        try {
+            setPreview(await api.manualSettleVerify(reference.trim()));
+        } catch (e: any) {
+            setError(e?.message || 'Verification failed.');
+        } finally {
+            setBusy(null);
+        }
+    };
+
+    const settle = async () => {
+        setBusy('settle');
+        setError(null);
+        try {
+            const result = await api.manualSettleConfirm(reference.trim());
+            setOutcome(result.status);
+            setPreview(null);
+            if (result.status !== 'ALREADY_SETTLED') onSettled();
+        } catch (e: any) {
+            setError(e?.message || 'Settlement failed.');
+        } finally {
+            setBusy(null);
+        }
+    };
+
+    return (
+        <Card className="p-5 space-y-3">
+            <div className="text-[13px] font-bold text-[#8E8E93] uppercase tracking-widest">
+                Manual settle — escape hatch
+            </div>
+            <p className="text-[12px] text-[#8E8E93]">
+                If a customer paid but no booking appeared and the automatic sweep has not fixed it,
+                paste the Paystack reference here. Verify shows what Paystack has before anything is written.
+            </p>
+            <div className="flex flex-wrap gap-2">
+                <input
+                    value={reference}
+                    onChange={e => { setReference(e.target.value); reset(); }}
+                    placeholder="e.g. WAYLINS-1753…"
+                    className="flex-1 min-w-[220px] p-2.5 bg-[#F2F2F7] rounded-xl text-sm font-mono"
+                />
+                <Button onClick={verify} disabled={!reference.trim() || busy !== null}>
+                    {busy === 'verify' ? <Loader2 className="animate-spin" size={16} /> : 'Verify'}
+                </Button>
+            </div>
+            {error && <div className="text-sm font-medium text-[#FF3B30]">{error}</div>}
+            {outcome && (
+                <div className={`text-sm font-semibold ${outcome === 'PAID_BOOKED' ? 'text-[#34C759]' : 'text-[#FF9500]'}`}>
+                    {outcome === 'PAID_BOOKED' && 'Settled — booking created and ledger row written.'}
+                    {outcome === 'ALREADY_SETTLED' && 'Nothing to do — a ledger row already exists for this reference.'}
+                    {outcome !== 'PAID_BOOKED' && outcome !== 'ALREADY_SETTLED' &&
+                        `Settled as ${outcome.replace(/_/g, ' ')} — see the Needs attention section.`}
+                </div>
+            )}
+            {preview && (
+                <div className="p-4 bg-[#F2F2F7] rounded-xl space-y-2 text-sm">
+                    <div className="font-bold text-[#1C1C1E] flex items-center gap-2 flex-wrap">
+                        Paystack found: R{preview.amountRand.toFixed(2)} · {preview.paystackStatus}
+                        {preview.env === 'test' && (
+                            <span className="px-1.5 py-0.5 rounded bg-[#AF52DE]/15 text-[#AF52DE] text-[10px] font-bold uppercase">Test — not real money</span>
+                        )}
+                    </div>
+                    <div className="text-[#8E8E93]">
+                        {preview.clientName ? `${preview.clientName} (${preview.clientPhone ?? '?'})` : 'No client metadata'}
+                        {preview.serviceName ? ` · ${preview.serviceName}` : ''}
+                        {preview.date ? ` · ${preview.date} at ${preview.timeSlot ?? '?'}` : ''}
+                        {preview.paidAt ? ` · paid ${preview.paidAt}` : ''}
+                    </div>
+                    {preview.ledgerExists ? (
+                        <div className="font-semibold text-[#34C759]">Already settled — a ledger row exists. Nothing to do.</div>
+                    ) : (
+                        <>
+                            <div className="text-[12px] text-[#8E8E93]">
+                                No ledger row exists for this reference.
+                                {preview.pendingExists
+                                    ? ' The original booking intent is still stored — settling will use it.'
+                                    : ' The booking intent is gone — settling will rebuild the booking from Paystack metadata if possible.'}
+                            </div>
+                            {preview.paystackStatus === 'success' ? (
+                                <Button onClick={settle} disabled={busy !== null}>
+                                    {busy === 'settle' ? <Loader2 className="animate-spin" size={16} /> : 'Settle this payment'}
+                                </Button>
+                            ) : (
+                                <div className="font-semibold text-[#FF3B30]">Not a successful charge — cannot be settled.</div>
+                            )}
+                        </>
+                    )}
+                </div>
+            )}
+        </Card>
+    );
+};
+
 const StatementTab: React.FC = () => {
     const [rows, setRows] = useState<StatementRow[]>([]);
     const [isLoading, setIsLoading] = useState(true);
@@ -818,6 +927,8 @@ const StatementTab: React.FC = () => {
     const [customEnd, setCustomEnd] = useState(format(new Date(), 'yyyy-MM-dd'));
     const [showTest, setShowTest] = useState(false);
     const [openGroups, setOpenGroups] = useState<Set<string>>(new Set());
+    // Bumped after a manual settle so the freshly written row appears.
+    const [reloadKey, setReloadKey] = useState(0);
 
     const [start, end] = ((): [Date, Date] => {
         const now = new Date();
@@ -852,7 +963,7 @@ const StatementTab: React.FC = () => {
                 if (mounted) setLoadError('Could not load the ledger. Check your connection and try again.');
             })
             .finally(() => { if (mounted) setIsLoading(false); });
-    }, [range, customStart, customEnd]);
+    }, [range, customStart, customEnd, reloadKey]);
 
     const visible = rows.filter(r => showTest || r.row.mode !== 'test');
     // Test rows are excluded from ALL totals unconditionally — visibility is
@@ -1051,6 +1162,9 @@ const StatementTab: React.FC = () => {
                     );
                 })
             )}
+
+            {/* Manual settle escape hatch */}
+            <ManualSettleCard onSettled={() => setReloadKey(k => k + 1)} />
         </div>
     );
 };
