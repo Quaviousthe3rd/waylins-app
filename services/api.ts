@@ -23,6 +23,9 @@ import {
   deleteDoc,
   query,
   where,
+  getDocs,
+  orderBy,
+  Timestamp,
 } from 'firebase/firestore';
 import {
   getAuth,
@@ -141,6 +144,29 @@ const fetchPaymentEnv = async (): Promise<PaymentEnv> => {
     }
 };
 
+// --- LEDGER (statement view) ---
+// One row per Paystack transaction, written ONLY by paystackWebhook.
+// Amounts are RAND. paystackFeeActual comes from the Paystack event and may
+// be null; estimatedFee is our own calculation — the UI must label which
+// one it is showing, never present an estimate as fact.
+export interface LedgerRow {
+    id: string;               // doc id == payment reference
+    reference: string;
+    status: string;           // PAID_BOOKED | REFUNDED | SLOT_TAKEN_REFUND | anomalies
+    mode: 'test' | 'live';
+    clientName: string | null;
+    serviceName: string | null;
+    date: string | null;      // booking date yyyy-MM-dd
+    timeSlot: string | null;
+    charged: number | null;   // gross amount the client paid (rand)
+    paystackFeeActual: number | null;
+    estimatedFee: number | null;
+    barberNet: number | null;
+    refundedAmount: number | null;
+    bookingId: string | null;
+    createdAt: Date | null;   // transaction time (webhook processing time)
+}
+
 // --- API IMPLEMENTATION ---
 
 export const api = {
@@ -179,6 +205,43 @@ export const api = {
           access_code: result?.data?.access_code ?? null,
           authorization_url: String(result?.data?.authorization_url),
       };
+  },
+
+  // Ledger rows for the statement view, queried by transaction-time range
+  // (a single-field range on createdAt — no composite index required).
+  // Admin-read-only by Firestore rules; non-admin callers get
+  // permission-denied. Never loads the whole collection.
+  getLedgerRows: async (start: Date, end: Date): Promise<LedgerRow[]> => {
+      if (!db) throw new Error('Database not connected.');
+      const q = query(
+          collection(db, 'ledger'),
+          where('createdAt', '>=', Timestamp.fromDate(start)),
+          where('createdAt', '<=', Timestamp.fromDate(end)),
+          orderBy('createdAt', 'desc'),
+      );
+      const snap = await getDocs(q);
+      return snap.docs.map(d => {
+          const r = d.data() as any;
+          const num = (v: any): number | null =>
+              typeof v === 'number' && Number.isFinite(v) ? v : null;
+          return {
+              id: d.id,
+              reference: String(r.reference ?? d.id),
+              status: String(r.status ?? 'UNKNOWN'),
+              mode: r.mode === 'test' ? 'test' : 'live',
+              clientName: r.clientName ? String(r.clientName) : null,
+              serviceName: r.serviceName ? String(r.serviceName) : null,
+              date: r.date ? String(r.date) : null,
+              timeSlot: r.timeSlot ? String(r.timeSlot) : null,
+              charged: num(r.charged),
+              paystackFeeActual: num(r.paystackFeeActual),
+              estimatedFee: num(r.estimatedFee),
+              barberNet: num(r.barberNet),
+              refundedAmount: num(r.refundedAmount),
+              bookingId: r.bookingId ? String(r.bookingId) : null,
+              createdAt: r.createdAt?.toDate ? r.createdAt.toDate() : null,
+          };
+      });
   },
 
   // Move an EXISTING booking to a new date/time (server-side callable).

@@ -1,11 +1,11 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Link } from 'react-router-dom';
-import { api } from '../services/api';
+import { api, LedgerRow } from '../services/api';
 import { Booking, ServiceItem, BookingStatus, PaymentStatus, Blockout } from '../types';
 import { Button } from '../components/ui/Button';
 import { Card } from '../components/ui/Card';
-import { Calendar, List, Settings, Scissors, Clock, LogOut, Plus, Trash, Ban, Search, ChevronRight, CreditCard, RefreshCw, X, Edit2, Phone, Menu, Loader2 } from 'lucide-react';
-import { format, isBefore, parseISO } from 'date-fns';
+import { Calendar, List, Settings, Scissors, Clock, LogOut, Plus, Trash, Ban, Search, ChevronRight, ChevronDown, CreditCard, RefreshCw, X, Edit2, Phone, Menu, Loader2, AlertTriangle } from 'lucide-react';
+import { format, isBefore, parseISO, startOfMonth, endOfMonth, subMonths } from 'date-fns';
 import { DEFAULT_HOURS } from '../constants';
 import { notify } from '../services/notifications';
 
@@ -654,12 +654,323 @@ const SettingsTab: React.FC = () => {
     )
 }
 
+// --- Statement Tab ---
+// The barber's itemised truth: every ledger row (one per Paystack
+// transaction) traceable to a named client and a specific haircut, with
+// totals that reconcile against the bank's batched Paystack settlements.
+// All arithmetic is done in integer CENTS; rand floats never touch a sum.
+
+const ANOMALY_STATUSES = new Set([
+    'UNMATCHED_PAYMENT',
+    'AMOUNT_MISMATCH',
+    'ORPHANED_PAYMENT',
+    'MODE_MISMATCH',
+    'SLOT_TAKEN_REFUND',
+]);
+
+const toCents = (rand: number | null): number | null =>
+    rand === null ? null : Math.round(rand * 100);
+const fmtRand = (cents: number): string => `R${(cents / 100).toFixed(2)}`;
+
+interface StatementRow {
+    row: LedgerRow;
+    chargedC: number | null;
+    feeC: number | null;
+    feeIsActual: boolean;      // false = ESTIMATED fee shown — labelled in UI
+    ownerCutC: number | null;  // derived: charged - fee - barberNet
+    barberNetC: number | null;
+    isAnomaly: boolean;
+    // A PAID/REFUNDED row whose components don't decompose to the charged
+    // amount. Flagged visually, never silently hidden.
+    broken: boolean;
+}
+
+interface Totals { charged: number; fees: number; ownerCut: number; barberNet: number; }
+const zeroTotals = (): Totals => ({ charged: 0, fees: 0, ownerCut: 0, barberNet: 0 });
+
+const deriveRow = (row: LedgerRow): StatementRow => {
+    const chargedC = toCents(row.charged);
+    const feeIsActual = row.paystackFeeActual !== null;
+    const feeC = toCents(row.paystackFeeActual ?? row.estimatedFee);
+    const barberNetC = toCents(row.barberNet);
+    const ownerCutC =
+        chargedC !== null && feeC !== null && barberNetC !== null
+            ? chargedC - feeC - barberNetC
+            : null;
+    const isAnomaly = ANOMALY_STATUSES.has(row.status);
+    const broken =
+        !isAnomaly &&
+        (chargedC === null || feeC === null || barberNetC === null ||
+         ownerCutC === null || ownerCutC < 0 ||
+         feeC + ownerCutC + barberNetC !== chargedC);
+    return { row, chargedC, feeC, feeIsActual, ownerCutC, barberNetC, isAnomaly, broken };
+};
+
+// REFUNDED rows are shown but SUBTRACTED from totals; anomaly and broken
+// rows contribute nothing (their money did not resolve cleanly). Test rows
+// never reach this function.
+const addToTotals = (t: Totals, r: StatementRow): void => {
+    if (r.isAnomaly || r.broken) return;
+    const sign = r.row.status === 'REFUNDED' ? -1 : r.row.status === 'PAID_BOOKED' ? 1 : 0;
+    if (sign === 0) return;
+    t.charged += sign * (r.chargedC ?? 0);
+    t.fees += sign * (r.feeC ?? 0);
+    t.ownerCut += sign * (r.ownerCutC ?? 0);
+    t.barberNet += sign * (r.barberNetC ?? 0);
+};
+
+const StatementTab: React.FC = () => {
+    const [rows, setRows] = useState<StatementRow[]>([]);
+    const [isLoading, setIsLoading] = useState(true);
+    const [loadError, setLoadError] = useState<string | null>(null);
+    const [range, setRange] = useState<'this' | 'last' | 'custom'>('this');
+    const [customStart, setCustomStart] = useState(format(startOfMonth(new Date()), 'yyyy-MM-dd'));
+    const [customEnd, setCustomEnd] = useState(format(new Date(), 'yyyy-MM-dd'));
+    const [showTest, setShowTest] = useState(false);
+    const [openGroups, setOpenGroups] = useState<Set<string>>(new Set());
+
+    const [start, end] = ((): [Date, Date] => {
+        const now = new Date();
+        if (range === 'this') return [startOfMonth(now), endOfMonth(now)];
+        if (range === 'last') {
+            const lm = subMonths(now, 1);
+            return [startOfMonth(lm), endOfMonth(lm)];
+        }
+        const s = parseISO(customStart);
+        const e = parseISO(customEnd);
+        e.setHours(23, 59, 59, 999);
+        return [s, e];
+    })();
+
+    useEffect(() => {
+        let mounted = true;
+        setIsLoading(true);
+        setLoadError(null);
+        api.getLedgerRows(start, end)
+            .then(ledger => {
+                if (!mounted) return;
+                const derived = ledger.map(deriveRow);
+                setRows(derived);
+                // Most recent day open by default.
+                const first = derived.find(r => r.row.createdAt);
+                setOpenGroups(first?.row.createdAt
+                    ? new Set([format(first.row.createdAt, 'yyyy-MM-dd')])
+                    : new Set());
+            })
+            .catch(e => {
+                console.error('ledger query failed', e);
+                if (mounted) setLoadError('Could not load the ledger. Check your connection and try again.');
+            })
+            .finally(() => { if (mounted) setIsLoading(false); });
+    }, [range, customStart, customEnd]);
+
+    const visible = rows.filter(r => showTest || r.row.mode !== 'test');
+    // Test rows are excluded from ALL totals unconditionally — visibility is
+    // a debugging aid, never money.
+    const liveRows = rows.filter(r => r.row.mode !== 'test');
+    const anomalies = visible.filter(r => r.isAnomaly);
+    const listed = visible.filter(r => !r.isAnomaly);
+
+    const grandTotals = zeroTotals();
+    liveRows.forEach(r => addToTotals(grandTotals, r));
+
+    // Group by calendar day of the TRANSACTION — Paystack settlement data is
+    // not recorded yet (stated in the UI). Keys sort desc (query is desc).
+    const groups = new Map<string, StatementRow[]>();
+    listed.forEach(r => {
+        const key = r.row.createdAt ? format(r.row.createdAt, 'yyyy-MM-dd') : 'Unknown date';
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key)!.push(r);
+    });
+
+    const toggleGroup = (key: string) => {
+        setOpenGroups(prev => {
+            const next = new Set(prev);
+            next.has(key) ? next.delete(key) : next.add(key);
+            return next;
+        });
+    };
+
+    const statusBadge = (r: StatementRow) => {
+        const s = r.row.status;
+        const cls =
+            s === 'PAID_BOOKED' ? 'bg-[#34C759]/10 text-[#34C759]'
+            : s === 'REFUNDED' ? 'bg-[#FF9500]/15 text-[#FF9500]'
+            : 'bg-[#FF3B30]/10 text-[#FF3B30]';
+        return <span className={`inline-block px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wide ${cls}`}>{s.replace(/_/g, ' ')}</span>;
+    };
+
+    const totalsStrip = (t: Totals, label: string) => (
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-sm">
+            {[
+                ['Charged', t.charged],
+                ['Paystack fees', t.fees],
+                ['Owner cut', t.ownerCut],
+                ['Barber net', t.barberNet],
+            ].map(([name, cents]) => (
+                <div key={String(name)} className="bg-[#F2F2F7] rounded-xl p-3">
+                    <div className="text-[10px] font-bold text-[#8E8E93] uppercase tracking-widest">{name} · {label}</div>
+                    <div className={`text-lg font-bold ${Number(cents) < 0 ? 'text-[#FF3B30]' : 'text-[#1C1C1E]'}`}>{fmtRand(Number(cents))}</div>
+                </div>
+            ))}
+        </div>
+    );
+
+    const renderRow = (r: StatementRow) => (
+        <div key={r.row.id} className={`p-4 text-sm ${r.broken ? 'bg-[#FF3B30]/5 border-l-4 border-[#FF3B30]' : ''} ${r.row.status === 'REFUNDED' ? 'bg-[#FF9500]/5' : ''}`}>
+            <div className="flex items-start justify-between gap-3 flex-wrap">
+                <div>
+                    <div className="font-semibold text-[#1C1C1E] flex items-center gap-2">
+                        {r.row.clientName || <span className="text-[#8E8E93] italic">Unknown client</span>}
+                        {r.row.mode === 'test' && (
+                            <span className="px-1.5 py-0.5 rounded bg-[#AF52DE]/15 text-[#AF52DE] text-[10px] font-bold uppercase">Test — not real money</span>
+                        )}
+                        {statusBadge(r)}
+                    </div>
+                    <div className="text-[#8E8E93]">
+                        {r.row.serviceName || '—'}{r.row.date ? ` · ${r.row.date} at ${r.row.timeSlot ?? '?'}` : ''}
+                    </div>
+                    <div className="text-[11px] text-[#8E8E93] font-mono mt-1">{r.row.reference}</div>
+                </div>
+                <div className="text-right">
+                    <div className={`text-lg font-bold ${r.row.status === 'REFUNDED' ? 'text-[#FF9500] line-through' : 'text-[#1C1C1E]'}`}>
+                        {r.chargedC !== null ? fmtRand(r.chargedC) : '—'}
+                    </div>
+                    {r.row.status === 'REFUNDED' && (
+                        <div className="text-[11px] font-bold text-[#FF9500]">REFUNDED — subtracted from totals</div>
+                    )}
+                </div>
+            </div>
+            <div className="mt-2 flex flex-wrap gap-x-5 gap-y-1 text-[12px] text-[#8E8E93]">
+                <span>Fee: {r.feeC !== null ? fmtRand(r.feeC) : '—'} <em className="not-italic font-semibold">({r.feeIsActual ? 'actual' : 'ESTIMATED'})</em></span>
+                <span>Owner cut: {r.ownerCutC !== null ? fmtRand(r.ownerCutC) : '—'}</span>
+                <span>Barber net: {r.barberNetC !== null ? fmtRand(r.barberNetC) : '—'}</span>
+            </div>
+            {r.broken && (
+                <div className="mt-2 text-[12px] font-semibold text-[#FF3B30] flex items-center gap-1.5">
+                    <AlertTriangle size={14} /> Components do not sum to the charged amount — excluded from totals. Reconcile manually.
+                </div>
+            )}
+        </div>
+    );
+
+    if (isLoading) {
+        return <div className="flex items-center justify-center py-20"><Loader2 className="animate-spin text-[#8E8E93]" size={28} /></div>;
+    }
+    if (loadError) {
+        return <Card className="p-6 text-sm text-[#FF3B30] font-medium">{loadError}</Card>;
+    }
+
+    return (
+        <div className="space-y-5 max-w-3xl">
+            {/* Filters */}
+            <div className="flex flex-wrap items-center gap-2">
+                {([['this', 'This month'], ['last', 'Last month'], ['custom', 'Custom']] as const).map(([k, label]) => (
+                    <button
+                        key={k}
+                        onClick={() => setRange(k)}
+                        className={`px-4 py-2 rounded-full text-sm font-semibold transition-colors ${range === k ? 'bg-[#1C1C1E] text-white' : 'bg-white text-[#8E8E93] hover:text-[#1C1C1E]'}`}
+                    >{label}</button>
+                ))}
+                {range === 'custom' && (
+                    <div className="flex items-center gap-2">
+                        <input type="date" value={customStart} onChange={e => setCustomStart(e.target.value)} className="p-2 bg-white rounded-xl text-sm" />
+                        <span className="text-[#8E8E93]">–</span>
+                        <input type="date" value={customEnd} onChange={e => setCustomEnd(e.target.value)} className="p-2 bg-white rounded-xl text-sm" />
+                    </div>
+                )}
+                <label className="ml-auto flex items-center gap-2 text-sm font-medium text-[#8E8E93] cursor-pointer select-none">
+                    <input type="checkbox" checked={showTest} onChange={e => setShowTest(e.target.checked)} className="accent-[#AF52DE]" />
+                    Show test rows
+                </label>
+            </div>
+
+            {showTest && (
+                <div className="p-3 bg-[#AF52DE]/10 text-[#AF52DE] rounded-xl text-sm font-semibold">
+                    Test rows visible (purple badges). They are NEVER included in any total.
+                </div>
+            )}
+
+            <div className="text-[12px] text-[#8E8E93]">
+                Grouped by <strong>transaction day</strong> — Paystack settlement dates are not recorded yet, so
+                reconcile a bank deposit against the day(s) it covers (Paystack settles next business day).
+            </div>
+
+            {/* Needs attention */}
+            {anomalies.length > 0 && (
+                <Card noPadding className="border-2 border-[#FF3B30]/40 overflow-hidden">
+                    <div className="p-4 bg-[#FF3B30]/10 flex items-center gap-2 font-bold text-[#FF3B30]">
+                        <AlertTriangle size={18} /> Needs attention — money that did not resolve cleanly
+                    </div>
+                    <div className="divide-y divide-[#E5E5EA]">{anomalies.map(renderRow)}</div>
+                </Card>
+            )}
+
+            {/* Grand total for the period (live rows only) */}
+            <Card className="p-5 space-y-3">
+                <div className="text-[13px] font-bold text-[#8E8E93] uppercase tracking-widest">
+                    Period total · {format(start, 'd MMM')} – {format(end, 'd MMM yyyy')} · live money only
+                </div>
+                {totalsStrip(grandTotals, 'period')}
+            </Card>
+
+            {/* Day groups */}
+            {groups.size === 0 ? (
+                <Card className="p-10 text-center">
+                    <CreditCard className="mx-auto mb-4 text-[#C7C7CC]" size={40} />
+                    <div className="font-semibold text-[#1C1C1E] mb-1">No transactions in this period</div>
+                    <p className="text-sm text-[#8E8E93] max-w-sm mx-auto">
+                        Every paid online booking will appear here automatically, itemised per client,
+                        so the batched Paystack deposits in the bank can be reconciled line by line.
+                        {!showTest && ' (Test-mode transactions are hidden — use the toggle above to inspect them.)'}
+                    </p>
+                </Card>
+            ) : (
+                Array.from(groups.entries()).map(([day, groupRows]) => {
+                    const groupTotals = zeroTotals();
+                    groupRows.filter(r => r.row.mode !== 'test').forEach(r => addToTotals(groupTotals, r));
+                    const open = openGroups.has(day);
+                    return (
+                        <Card key={day} noPadding className="overflow-hidden">
+                            <button onClick={() => toggleGroup(day)} className="w-full p-4 flex items-center justify-between hover:bg-[#F2F2F7]/50 transition-colors">
+                                <div className="flex items-center gap-3">
+                                    {open ? <ChevronDown size={18} className="text-[#8E8E93]" /> : <ChevronRight size={18} className="text-[#8E8E93]" />}
+                                    <div className="text-left">
+                                        <div className="font-bold text-[#1C1C1E]">
+                                            {day === 'Unknown date' ? day : format(parseISO(day), 'EEEE, d MMMM yyyy')}
+                                        </div>
+                                        <div className="text-[12px] text-[#8E8E93]">{groupRows.length} transaction{groupRows.length === 1 ? '' : 's'}</div>
+                                    </div>
+                                </div>
+                                <div className="text-right text-sm">
+                                    <div className="font-bold text-[#1C1C1E]">{fmtRand(groupTotals.charged)}</div>
+                                    <div className="text-[11px] text-[#8E8E93]">barber net {fmtRand(groupTotals.barberNet)}</div>
+                                </div>
+                            </button>
+                            {open && (
+                                <>
+                                    <div className="divide-y divide-[#E5E5EA] border-t border-[#E5E5EA]">
+                                        {groupRows.map(renderRow)}
+                                    </div>
+                                    <div className="p-4 border-t border-[#E5E5EA] bg-[#F2F2F7]/40">
+                                        {totalsStrip(groupTotals, 'day')}
+                                    </div>
+                                </>
+                            )}
+                        </Card>
+                    );
+                })
+            )}
+        </div>
+    );
+};
+
 // --- Main Admin Layout ---
 
 export const AdminPortal: React.FC = () => {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [authChecked, setAuthChecked] = useState(false);
-  const [activeTab, setActiveTab] = useState<'bookings' | 'services' | 'settings'>('bookings');
+  const [activeTab, setActiveTab] = useState<'bookings' | 'statement' | 'services' | 'settings'>('bookings');
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const mainRef = useRef<HTMLDivElement>(null);
 
@@ -681,7 +992,7 @@ export const AdminPortal: React.FC = () => {
       }
   }, [activeTab]);
 
-  const handleNavClick = (tab: 'bookings' | 'services' | 'settings') => {
+  const handleNavClick = (tab: 'bookings' | 'statement' | 'services' | 'settings') => {
       setActiveTab(tab);
       setIsSidebarOpen(false);
   };
@@ -746,7 +1057,13 @@ export const AdminPortal: React.FC = () => {
                 >
                 <Calendar size={18} /> Bookings
                 </button>
-                <button 
+                <button
+                onClick={() => handleNavClick('statement')}
+                className={`w-full flex items-center gap-3 p-3 rounded-xl font-medium transition-all duration-200 text-sm ${activeTab === 'statement' ? 'bg-[#E5E5EA] text-[#1C1C1E]' : 'text-[#8E8E93] hover:text-[#1C1C1E] hover:bg-[#E5E5EA]/50'}`}
+                >
+                <CreditCard size={18} /> Statement
+                </button>
+                <button
                 onClick={() => handleNavClick('services')}
                 className={`w-full flex items-center gap-3 p-3 rounded-xl font-medium transition-all duration-200 text-sm ${activeTab === 'services' ? 'bg-[#E5E5EA] text-[#1C1C1E]' : 'text-[#8E8E93] hover:text-[#1C1C1E] hover:bg-[#E5E5EA]/50'}`}
                 >
@@ -773,6 +1090,7 @@ export const AdminPortal: React.FC = () => {
         <header className="mb-8 hidden md:block">
             <h2 className="text-3xl font-bold text-[#1C1C1E] tracking-tight mb-1">
                 {activeTab === 'bookings' && 'Overview'}
+                {activeTab === 'statement' && 'Statement'}
                 {activeTab === 'services' && 'Services'}
                 {activeTab === 'settings' && 'Settings'}
             </h2>
@@ -780,12 +1098,14 @@ export const AdminPortal: React.FC = () => {
         <header className="mb-6 md:hidden">
              <h2 className="text-2xl font-bold text-[#1C1C1E] tracking-tight">
                 {activeTab === 'bookings' && 'Overview'}
+                {activeTab === 'statement' && 'Statement'}
                 {activeTab === 'services' && 'Services'}
                 {activeTab === 'settings' && 'Settings'}
             </h2>
         </header>
 
         {activeTab === 'bookings' && <BookingsTab />}
+        {activeTab === 'statement' && <StatementTab />}
         {activeTab === 'services' && <ServicesTab />}
         {activeTab === 'settings' && <SettingsTab />}
       </main>
