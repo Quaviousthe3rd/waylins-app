@@ -22,8 +22,6 @@ const db = getFirestore();
 
 const PAYSTACK_SECRET_KEY = defineSecret("PAYSTACK_SECRET_KEY");
 const PAYSTACK_SECRET_KEY_TEST = defineSecret("PAYSTACK_SECRET_KEY_TEST");
-// One-off B2 migration guard (see backfillSlotClaims at the bottom).
-const BACKFILL_TOKEN = defineSecret("BACKFILL_TOKEN");
 
 // --- Payment mode ---
 // settings/paymentConfig.mode switches the ENTIRE money path between
@@ -1433,59 +1431,5 @@ export const paystackWebhook = onRequest(
       );
     }
     res.status(200).send("ok");
-  }
-);
-
-// --- B2 migration: backfill slot claims for existing bookings ---
-// One-off, idempotent, non-destructive: creates/overwrites CONFIRMED claims
-// for every future non-cancelled booking so pre-existing appointments block
-// slots the moment the claim-based availability goes live. Guarded by a
-// deploy-time secret because there is no admin session available headless;
-// safe to re-run any time (it only converges claims to booking truth).
-export const backfillSlotClaims = onRequest(
-  { secrets: [BACKFILL_TOKEN] },
-  async (req, res) => {
-    const auth = String(req.headers.authorization ?? "");
-    if (auth !== `Bearer ${BACKFILL_TOKEN.value()}`) {
-      res.status(401).send("unauthorized");
-      return;
-    }
-    // "Future" = today (UTC-24h, timezone-safe) onward.
-    const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000)
-      .toISOString()
-      .slice(0, 10);
-    const snap = await db
-      .collection("bookings")
-      .where("date", ">=", cutoff)
-      .get();
-    let backfilled = 0;
-    let skippedCancelled = 0;
-    const batch = db.batch();
-    for (const d of snap.docs) {
-      const bk = d.data() as any;
-      if (String(bk.status ?? "") === "Cancelled") {
-        skippedCancelled++;
-        continue;
-      }
-      const ids = cellIdsFor(
-        String(bk.date ?? ""),
-        String(bk.timeSlot ?? "00:00"),
-        Number(bk.durationMinutes) || 60
-      );
-      ids.forEach((id) => {
-        batch.set(db.doc(`slotClaims/${id}`), {
-          bookingRef: String(bk.paymentReference ?? "") || null,
-          bookingId: d.id,
-          status: "confirmed",
-          date: String(bk.date ?? ""),
-          time: id.slice(String(bk.date ?? "").length + 1),
-          expiresAt: null,
-          createdAt: FieldValue.serverTimestamp(),
-        });
-      });
-      backfilled++;
-    }
-    await batch.commit();
-    res.json({ ok: true, bookingsBackfilled: backfilled, skippedCancelled, scannedFrom: cutoff });
   }
 );
