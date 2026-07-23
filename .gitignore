@@ -26,6 +26,15 @@ dist-ssr
 
 # Environment variables
 .env
+.env.local
+
+# Service account keys must NEVER be committed
+serviceAccount*.json
+
+# Stray local artifacts
+*.sqlite
+*.sqlite3
+.vs/
 
 # Firebase deploy cache
 .firebase/
