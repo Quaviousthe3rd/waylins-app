@@ -59,3 +59,5 @@ The GitHub Action (`.github/workflows/firebase-deploy.yml`) also deploys
 hosting to `waylins-37532` on every push to `main`; it needs the
 `FIREBASE_SERVICE_ACCOUNT_WAYLINS_37532` repo secret plus the six `VITE_*`
 variables above as repo secrets to produce a configured build.
+
+<!-- CI trigger: verify Action deploys to waylins-37532 -->
