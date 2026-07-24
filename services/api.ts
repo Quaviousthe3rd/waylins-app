@@ -9,7 +9,7 @@ import {
   WorkingHours
 } from '../types';
 import { INITIAL_CONFIG, STORAGE_KEYS } from '../constants';
-import { format, parse, addMinutes, areIntervalsOverlapping, getDay } from 'date-fns';
+import { computeAvailableSlots, parseDay } from './availability';
 
 // --- FIREBASE IMPORTS ---
 import { initializeApp, getApps, getApp } from 'firebase/app';
@@ -409,12 +409,22 @@ export const api = {
             const configRef = doc(db, 'settings', 'storeConfig');
             onSnapshot(configRef, (doc) => {
                 if (doc.exists()) {
-                    configCache = doc.data() as StoreConfig;
-                    // Merge defaults in case of new fields
+                    const raw = doc.data() as Partial<StoreConfig>;
+                    // DEEP merge: weeklyHours must be merged PER DAY against
+                    // defaults — a shallow merge lets a doc missing one day
+                    // (e.g. only days 0-5 saved) crash every consumer of
+                    // weeklyHours[6].isClosed.
+                    const mergedHours: StoreConfig['weeklyHours'] = { ...INITIAL_CONFIG.weeklyHours };
+                    for (let day = 0; day < 7; day++) {
+                        const h = raw.weeklyHours?.[day];
+                        if (h && typeof h === 'object') {
+                            mergedHours[day] = { ...INITIAL_CONFIG.weeklyHours[day], ...h };
+                        }
+                    }
                     configCache = {
-                        services: configCache.services || INITIAL_CONFIG.services,
-                        weeklyHours: configCache.weeklyHours || INITIAL_CONFIG.weeklyHours,
-                        blockouts: configCache.blockouts || []
+                        services: raw.services || INITIAL_CONFIG.services,
+                        weeklyHours: mergedHours,
+                        blockouts: raw.blockouts || []
                     };
                 } else {
                     // Config doc missing. Only the admin may seed it — the rules
@@ -480,94 +490,21 @@ export const api = {
   getClientBookings: (phone: string): Booking[] => {
     return bookingsCache
         .filter(b => b.clientPhone === phone)
-        .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+        .sort((a, b) => parseDay(b.date).getTime() - parseDay(a.date).getTime());
   },
 
+  // Thin wrapper over the pure, timezone-safe implementation in
+  // availability.ts (extracted so the 60-min-on-30-min-grid and mocked-TZ
+  // cases can be unit tested).
   getAvailableSlots: (dateStr: string, durationMinutes: number, excludeBookingId?: string): string[] => {
-    const config = configCache;
-    const allBookings = bookingsCache;
-    const dayOfWeek = getDay(new Date(dateStr));
-    const hours = config.weeklyHours[dayOfWeek];
-
-    if (!hours || hours.isClosed) return [];
-
-    // Check specific blockouts
-    const isBlockedDay = config.blockouts.some(b => {
-       if(b.date !== dateStr) return false;
-       // If blockout covers whole day
-       if (b.startTime <= hours.start && b.endTime >= hours.end) return true;
-       return false;
-    });
-
-    if (isBlockedDay) return [];
-
-    const [startH, startM] = hours.start.split(':').map(Number);
-    const [endH, endM] = hours.end.split(':').map(Number);
-    
-    const slots: string[] = [];
-    let current = new Date(dateStr);
-    current.setHours(startH, startM, 0, 0);
-    
-    const endTime = new Date(dateStr);
-    endTime.setHours(endH, endM, 0, 0);
-
-    // Filter relevant bookings/blockouts for this day
-    const dayBookings = allBookings.filter(b => 
-      b.date === dateStr && 
-      b.status !== BookingStatus.CANCELLED && 
-      b.id !== excludeBookingId
+    return computeAvailableSlots(
+      configCache,
+      bookingsCache,
+      claimsCache,
+      dateStr,
+      durationMinutes,
+      excludeBookingId
     );
-
-    const dayBlockouts = config.blockouts.filter(b => b.date === dateStr);
-
-    while (addMinutes(current, durationMinutes) <= endTime) {
-       const slotStart = current;
-       const slotEnd = addMinutes(current, durationMinutes);
-       const slotStr = format(slotStart, 'HH:mm');
-
-       const isOverlappingBooking = dayBookings.some(b => {
-          const bStart = parse(b.timeSlot, 'HH:mm', new Date(dateStr));
-          const bDuration = b.durationMinutes || 60; 
-          const bEnd = addMinutes(bStart, bDuration);
-          return areIntervalsOverlapping({ start: slotStart, end: slotEnd }, { start: bStart, end: bEnd });
-       });
-
-       // Claimed cells (server-side slot reservations). A slot is blocked if
-       // ANY 30-min cell it covers is confirmed, or held and not yet
-       // expired — unless the claim belongs to the booking being
-       // rescheduled (excludeBookingId).
-       const startMin = slotStart.getHours() * 60 + slotStart.getMinutes();
-       const firstCell = Math.floor(startMin / 30);
-       const lastCell = Math.ceil((startMin + durationMinutes) / 30);
-       let isClaimed = false;
-       for (let c = firstCell; c < lastCell; c++) {
-           const m = c * 30;
-           const hh = String(Math.floor(m / 60)).padStart(2, '0');
-           const mm = String(m % 60).padStart(2, '0');
-           const claim = claimsCache.get(`${dateStr}_${hh}:${mm}`);
-           if (!claim) continue;
-           if (excludeBookingId && claim.bookingId === excludeBookingId) continue;
-           if (claim.status === 'confirmed' ||
-               (claim.expiresAt !== null && claim.expiresAt.getTime() > Date.now())) {
-               isClaimed = true;
-               break;
-           }
-       }
-
-       const isOverlappingBlockout = dayBlockouts.some(b => {
-          const bStart = parse(b.startTime, 'HH:mm', new Date(dateStr));
-          const bEnd = parse(b.endTime, 'HH:mm', new Date(dateStr));
-          return areIntervalsOverlapping({ start: slotStart, end: slotEnd }, { start: bStart, end: bEnd });
-       });
-
-       if (!isOverlappingBooking && !isOverlappingBlockout && !isClaimed) {
-           slots.push(slotStr);
-       }
-
-       current = addMinutes(current, 30);
-    }
-    
-    return slots;
   },
 
   // --- WRITE OPERATIONS ---

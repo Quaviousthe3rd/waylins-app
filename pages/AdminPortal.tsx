@@ -4,6 +4,8 @@ import { api, LedgerRow, ManualSettlePreview } from '../services/api';
 import { Booking, ServiceItem, BookingStatus, PaymentStatus, Blockout } from '../types';
 import { Button } from '../components/ui/Button';
 import { Card } from '../components/ui/Card';
+import { ConfirmDialog } from '../components/ui/ConfirmDialog';
+import { ErrorBoundary } from '../components/ui/ErrorBoundary';
 import { Calendar, List, Settings, Scissors, Clock, LogOut, Plus, Trash, Ban, Search, ChevronRight, ChevronDown, CreditCard, RefreshCw, X, Edit2, Phone, Menu, Loader2, AlertTriangle } from 'lucide-react';
 import { format, isBefore, parseISO, startOfMonth, endOfMonth, subMonths } from 'date-fns';
 import { DEFAULT_HOURS } from '../constants';
@@ -98,6 +100,7 @@ const BookingsTab: React.FC<{ onOpenStatement?: () => void }> = ({ onOpenStateme
       paidBookingIds: Set<string>;
   } | null>(null);
   const [ledgerError, setLedgerError] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState<Booking | null>(null);
 
   useEffect(() => {
       let mounted = true;
@@ -142,14 +145,17 @@ const BookingsTab: React.FC<{ onOpenStatement?: () => void }> = ({ onOpenStateme
       setBookings(api.getBookings());
   };
 
-  const handleDelete = async (id: string) => {
-      if(confirm('Permanently delete this booking record?')) {
-          try {
-              await api.deleteBooking(id);
-          } catch (e) {
-              console.warn('Delete failed or item already gone', e);
-              refreshBookings();
-          }
+  const handleDeleteConfirmed = async () => {
+      if (!deleteTarget) return;
+      const id = deleteTarget.id;
+      setDeleteTarget(null);
+      try {
+          await api.deleteBooking(id);
+          notify.success('Booking record deleted');
+      } catch (e) {
+          console.warn('Delete failed or item already gone', e);
+          notify.error('Failed to delete the booking record.');
+          refreshBookings();
       }
   };
 
@@ -333,7 +339,7 @@ const BookingsTab: React.FC<{ onOpenStatement?: () => void }> = ({ onOpenStateme
                       <td className="p-4 whitespace-nowrap">
                           <div className="text-sm font-medium text-[#1C1C1E]">{b.serviceName}</div>
                           <div className="text-xs text-[#8E8E93] mt-0.5">
-                              {format(new Date(b.date), 'MMM d')} at {b.timeSlot}
+                              {format(parseISO(b.date), 'MMM d')} at {b.timeSlot}
                           </div>
                           <div className="text-[10px] text-[#8E8E93] mt-0.5">
                               {(b.durationMinutes || 60)} mins
@@ -389,7 +395,7 @@ const BookingsTab: React.FC<{ onOpenStatement?: () => void }> = ({ onOpenStateme
                                 </button>
                             )}
                             {b.status === BookingStatus.CANCELLED && (
-                                <button onClick={() => handleDelete(b.id)} className="text-[#C7C7CC] hover:text-[#FF3B30] hover:bg-[#FF3B30]/10 p-2 rounded-full transition-all">
+                                <button onClick={() => setDeleteTarget(b)} className="text-[#C7C7CC] hover:text-[#FF3B30] hover:bg-[#FF3B30]/10 p-2 rounded-full transition-all">
                                     <Trash size={18} />
                                 </button>
                             )}
@@ -402,6 +408,15 @@ const BookingsTab: React.FC<{ onOpenStatement?: () => void }> = ({ onOpenStateme
         </div>
         {filtered.length === 0 && <div className="p-12 text-center text-[#8E8E93] text-sm">No matching bookings.</div>}
       </div>
+      <ConfirmDialog
+          open={deleteTarget !== null}
+          title="Delete booking record?"
+          message={deleteTarget ? `${deleteTarget.clientName} — ${deleteTarget.serviceName} on ${deleteTarget.date}. This permanently removes the record.` : ''}
+          confirmLabel="Delete permanently"
+          destructive
+          onConfirm={handleDeleteConfirmed}
+          onCancel={() => setDeleteTarget(null)}
+      />
     </div>
   );
 };
@@ -416,6 +431,8 @@ const ServicesTab: React.FC = () => {
   });
   
   const [initialData, setInitialData] = useState<{name: string, price: string, duration: string} | null>(null);
+  const [formError, setFormError] = useState<string | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<ServiceItem | null>(null);
 
   useEffect(() => {
       const unsubscribe = api.subscribe(() => {
@@ -442,7 +459,18 @@ const ServicesTab: React.FC = () => {
         const duration = parseInt(formData.duration);
 
         if(!formData.name || isNaN(price) || isNaN(duration)) return;
-        
+        // A zero/negative price or duration would quote R0 charges and
+        // zero-length slots — refuse with an inline error, never save.
+        if (price <= 0) {
+            setFormError('Price must be greater than R0.');
+            return;
+        }
+        if (duration <= 0) {
+            setFormError('Duration must be at least 1 minute.');
+            return;
+        }
+        setFormError(null);
+
         if (editingId && initialData) {
             const updates: Partial<ServiceItem> = {};
             if (formData.name !== initialData.name) updates.name = formData.name;
@@ -471,8 +499,10 @@ const ServicesTab: React.FC = () => {
     }
   };
 
-  const handleDelete = async (id: string) => {
-    if (!confirm('Delete this service?')) return;
+  const handleDeleteConfirmed = async () => {
+    if (!deleteTarget) return;
+    const id = deleteTarget.id;
+    setDeleteTarget(null);
     try {
         await api.deleteService(id);
         notify.success('Service deleted successfully');
@@ -523,6 +553,11 @@ const ServicesTab: React.FC = () => {
               onChange={e => setFormData({...formData, duration: e.target.value})}
             />
           </div>
+          {formError && (
+            <div className="mb-3 p-3 bg-[#FF3B30]/10 text-[#FF3B30] rounded-lg text-sm font-medium flex items-center gap-2">
+              <AlertTriangle size={14} /> {formError}
+            </div>
+          )}
           <div className="flex gap-3">
             <Button 
                 onClick={handleSave} 
@@ -554,13 +589,22 @@ const ServicesTab: React.FC = () => {
               <button onClick={() => openEdit(s)} className="text-[#C7C7CC] hover:text-[#007AFF] transition-colors p-2">
                   <Edit2 size={18}/>
               </button>
-              <button onClick={() => handleDelete(s.id)} className="text-[#C7C7CC] hover:text-[#FF3B30] transition-colors p-2">
+              <button onClick={() => setDeleteTarget(s)} className="text-[#C7C7CC] hover:text-[#FF3B30] transition-colors p-2">
                   <Trash size={18}/>
               </button>
             </div>
           </div>
         ))}
       </div>
+      <ConfirmDialog
+        open={deleteTarget !== null}
+        title="Delete service?"
+        message={deleteTarget ? `"${deleteTarget.name}" will no longer be bookable. Existing bookings are unaffected.` : ''}
+        confirmLabel="Delete service"
+        destructive
+        onConfirm={handleDeleteConfirmed}
+        onCancel={() => setDeleteTarget(null)}
+      />
     </div>
   );
 };
@@ -647,7 +691,9 @@ const SettingsTab: React.FC = () => {
                 {error && <div className="mb-4 p-3 bg-red-50 text-red-500 rounded-lg text-sm font-medium">{error}</div>}
                 <div className="bg-white rounded-2xl shadow-sm border border-[#C6C6C8]/30 overflow-hidden divide-y divide-[#C6C6C8]/30">
                     {days.map((day, idx) => {
-                        const hours = config.weeklyHours[idx];
+                        // Guarded: a config doc missing a day must render the
+                        // default rather than crash on hours.isClosed.
+                        const hours = config.weeklyHours[idx] || DEFAULT_HOURS[idx];
                         return (
                             <div key={idx} className="p-4 flex items-center justify-between">
                                 <span className="font-medium text-[#1C1C1E] text-sm">{day}</span>
@@ -729,7 +775,7 @@ const SettingsTab: React.FC = () => {
                          {config.blockouts.map(block => (
                              <div key={block.id} className="p-4 flex items-center justify-between">
                                  <div>
-                                     <div className="font-bold text-sm text-[#1C1C1E]">{format(new Date(block.date), 'MMM d, yyyy')}</div>
+                                     <div className="font-bold text-sm text-[#1C1C1E]">{format(parseISO(block.date), 'MMM d, yyyy')}</div>
                                      <div className="text-xs text-[#8E8E93] mt-0.5">{block.startTime} - {block.endTime} • {block.reason}</div>
                                  </div>
                                  <button onClick={() => removeBlockout(block.id)} className="text-[#C7C7CC] hover:text-[#FF3B30] p-2">
@@ -1311,7 +1357,11 @@ export const AdminPortal: React.FC = () => {
         {activeTab === 'bookings' && <BookingsTab onOpenStatement={() => setActiveTab('statement')} />}
         {activeTab === 'statement' && <StatementTab />}
         {activeTab === 'services' && <ServicesTab />}
-        {activeTab === 'settings' && <SettingsTab />}
+        {activeTab === 'settings' && (
+            <ErrorBoundary compact>
+                <SettingsTab />
+            </ErrorBoundary>
+        )}
       </main>
     </div>
   );

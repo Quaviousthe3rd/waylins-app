@@ -39,7 +39,7 @@ export const TermsOfService: React.FC = () => {
             <ul className="space-y-3 text-[#8E8E93]">
               <li className="flex items-start gap-2">
                 <span className="text-[#007AFF] font-bold">•</span>
-                <span>Payment can be made online via Paystack or in cash at the shop</span>
+                <span>Payment is made online via Paystack when booking</span>
               </li>
               <li className="flex items-start gap-2">
                 <span className="text-[#007AFF] font-bold">•</span>

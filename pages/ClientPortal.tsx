@@ -4,10 +4,12 @@ import PaystackPop from '@paystack/inline-js';
 import { Link } from 'react-router-dom';
 import { User, Calendar, Scissors, CreditCard, CheckCircle, Clock, ArrowLeft, LogOut, ChevronRight, ChevronLeft, Check, AlertCircle, RotateCcw } from 'lucide-react';
 import { api, PaymentEnv, ServiceQuote } from '../services/api';
-import { Client, ServiceItem, Booking, PaymentMethod, PaymentStatus, BookingStatus, Blockout } from '../types';
+import { Client, ServiceItem, Booking, PaymentStatus, BookingStatus, Blockout } from '../types';
 import { format, addDays, startOfToday, getDay } from 'date-fns';
+import { parseDay } from '../services/availability';
 import { Button } from '../components/ui/Button';
 import { Card } from '../components/ui/Card';
+import { ConfirmDialog } from '../components/ui/ConfirmDialog';
 import { notify } from '../services/notifications';
 import { Footer } from '../components/Footer';
 
@@ -131,7 +133,6 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
   const [selectedDate, setSelectedDate] = useState<string>('');
   const [selectedSlot, setSelectedSlot] = useState<string>('');
   const [selectedService, setSelectedService] = useState<ServiceItem | null>(preselectedService || null);
-  const [paymentMethod, setPaymentMethod] = useState<PaymentMethod | null>(null);
   const [availableSlots, setAvailableSlots] = useState<string[]>([]);
   const [finalBooking, setFinalBooking] = useState<Booking | null>(null);
   const [isLoading, setIsLoading] = useState(false);
@@ -232,13 +233,6 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
       }
     }
   }, [selectedDate, selectedService, rescheduleBooking, apiTick]);
-
-  // Default to online payment when entering payment step
-  useEffect(() => {
-    if (!paymentMethod) {
-      setPaymentMethod(PaymentMethod.ONLINE);
-    }
-  }, [paymentMethod]);
 
   // Server quote for the selected service — the wizard never computes prices.
   useEffect(() => {
@@ -368,7 +362,7 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
               <div className="flex justify-between items-center pb-4 border-b border-[#E5E5EA]">
                 <div>
                   <div className="text-[11px] font-bold text-[#8E8E93] uppercase tracking-widest mb-1">Time</div>
-                  <div className="text-xl font-semibold text-[#1C1C1E]">{format(new Date(finalBooking.date), 'EEE, d MMMM')}</div>
+                  <div className="text-xl font-semibold text-[#1C1C1E]">{format(parseDay(finalBooking.date), 'EEE, d MMMM')}</div>
                   <div className="text-lg text-[#007AFF]">{finalBooking.timeSlot}</div>
                 </div>
                 <div className="text-right">
@@ -457,7 +451,7 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
                <div className="mb-6 p-4 bg-[#007AFF]/10 text-[#007AFF] rounded-2xl flex items-start gap-3 text-sm font-medium animate-in slide-in-from-top-2">
                    <RotateCcw size={20} className="shrink-0 mt-0.5"/>
                    <div>
-                       You are rescheduling. Your booking for <strong>{format(new Date(rescheduleBooking.date), 'MMM d')} at {rescheduleBooking.timeSlot}</strong> will be moved to the new time you pick. Your original payment stays valid — no new charge.
+                       You are rescheduling. Your booking for <strong>{format(parseDay(rescheduleBooking.date), 'MMM d')} at {rescheduleBooking.timeSlot}</strong> will be moved to the new time you pick. Your original payment stays valid — no new charge.
                    </div>
                </div>
            )}
@@ -468,10 +462,20 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
                 <label className="block text-[13px] font-semibold text-[#8E8E93] uppercase tracking-wide px-2">Select Service</label>
                 <Card noPadding className="divide-y divide-[#E5E5EA]">
                     {config.services.map((service) => (
-                        <div 
-                            key={service.id} 
+                        <div
+                            key={service.id}
                             onClick={() => setSelectedService(service)}
-                            className={`p-5 cursor-pointer transition-colors flex items-center justify-between active:bg-[#F2F2F7]
+                            role="button"
+                            tabIndex={0}
+                            aria-label={`${service.name}, ${service.durationMinutes} minutes, R${service.price}`}
+                            aria-pressed={selectedService?.id === service.id}
+                            onKeyDown={e => {
+                                if (e.key === 'Enter' || e.key === ' ') {
+                                    e.preventDefault();
+                                    setSelectedService(service);
+                                }
+                            }}
+                            className={`p-5 cursor-pointer transition-colors flex items-center justify-between active:bg-[#F2F2F7] focus-visible:ring-2 focus-visible:ring-[#007AFF] outline-none
                                 ${selectedService?.id === service.id ? 'bg-[#F2F2F7]' : 'bg-white'}`}
                         >
                             <div className="flex-1">
@@ -620,7 +624,7 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
                  </div>
 
                  {/* Pay button — the server (initTransaction) owns amount and reference. */}
-                 {paymentMethod === PaymentMethod.ONLINE && selectedService && selectedDate && selectedSlot && (
+                 {selectedService && selectedDate && selectedSlot && (
                     <div className="mt-6">
                         {pendingReference ? (
                             <div className="p-4 bg-[#FF9500]/10 text-[#FF9500] rounded-2xl flex items-start gap-3 text-sm font-medium">
@@ -683,15 +687,14 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
          <div className="h-12 bg-gradient-to-t from-[#F2F2F7] to-transparent pointer-events-none" />
          <div className="bg-[#F2F2F7]/80 backdrop-blur-xl border-t border-[#000000]/10 p-4 pb-8">
              <div className="max-w-lg mx-auto">
-                {/* For Step 3 with online payment, PaystackButton is shown above, so hide this button */}
-                {!(step === 3 && paymentMethod === PaymentMethod.ONLINE) && (
-                    <Button 
-                        fullWidth 
-                        variant={step === 3 ? 'secondary' : 'primary'}
+                {/* Step 3's Pay button lives above, so hide this bar there */}
+                {step !== 3 && (
+                    <Button
+                        fullWidth
+                        variant="primary"
                         disabled={
-                            (step === 1 && !selectedService) || 
+                            (step === 1 && !selectedService) ||
                             (step === 2 && (!selectedDate || !selectedSlot)) ||
-                            (step === 3 && !paymentMethod) ||
                             isLoading ||
                             isProcessingPayment
                         }
@@ -700,7 +703,6 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
                             // Reschedule ends at step 2: confirm moves the
                             // existing booking — the payment step never runs.
                             else if(step === 2) rescheduleBooking ? handleConfirmReschedule() : setStep(3);
-                            else if(step === 3) handlePay();
                         }}
                         className="shadow-xl"
                     >
@@ -708,13 +710,11 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
                             ? 'Processing...'
                             : step === 2 && rescheduleBooking
                                 ? 'Confirm Reschedule'
-                                : step === 3
-                                    ? 'Confirm Booking'
-                                    : 'Continue'}
+                                : 'Continue'}
                     </Button>
                 )}
                 {/* Show message when processing online payment */}
-                {step === 3 && paymentMethod === PaymentMethod.ONLINE && isProcessingPayment && (
+                {step === 3 && isProcessingPayment && (
                     <div className="text-center text-sm text-[#8E8E93] font-medium py-2">
                         Processing payment...
                     </div>
@@ -729,6 +729,9 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
 const MyBookings: React.FC<{ client: Client, onBack: () => void, onReschedule: (booking: Booking) => void }> = ({ client, onBack, onReschedule }) => {
     const [bookings, setBookings] = useState<Booking[]>([]);
     const [refresh, setRefresh] = useState(0);
+    // In-app confirm (window.confirm is blocked in Instagram/WhatsApp
+    // in-app browsers, which silently made cancelling impossible there).
+    const [cancelTarget, setCancelTarget] = useState<Booking | null>(null);
 
     useEffect(() => {
         setBookings(api.getClientBookings(client.phone));
@@ -738,17 +741,18 @@ const MyBookings: React.FC<{ client: Client, onBack: () => void, onReschedule: (
         return unsubscribe;
     }, [client, refresh]);
 
-    const handleCancel = async (id: string) => {
-        if(confirm('Cancel this appointment?')) {
-            try {
-                // Server-side callable: direct booking writes are admin-only.
-                await api.cancelBooking(id, client.phone);
-                notify.success('Appointment cancelled successfully');
-            } catch (e) {
-                console.warn(e);
-                notify.error('Failed to cancel appointment. Please try again.');
-                setRefresh(r => r + 1); 
-            }
+    const handleCancelConfirmed = async () => {
+        if (!cancelTarget) return;
+        const id = cancelTarget.id;
+        setCancelTarget(null);
+        try {
+            // Server-side callable: direct booking writes are admin-only.
+            await api.cancelBooking(id, client.phone);
+            notify.success('Appointment cancelled successfully');
+        } catch (e) {
+            console.warn(e);
+            notify.error('Failed to cancel appointment. Please try again.');
+            setRefresh(r => r + 1);
         }
     }
 
@@ -776,7 +780,7 @@ const MyBookings: React.FC<{ client: Client, onBack: () => void, onReschedule: (
                                     <div className="flex justify-between items-start mb-3">
                                         <div>
                                             <div className="text-[11px] font-bold text-[#8E8E93] uppercase tracking-wide mb-1">
-                                                {format(new Date(b.date), 'MMM d, yyyy')}
+                                                {format(parseDay(b.date), 'MMM d, yyyy')}
                                             </div>
                                             <div className="font-semibold text-xl text-[#1C1C1E] tracking-tight">{b.serviceName}</div>
                                             <div className="text-[#007AFF] font-medium mt-0.5">{b.timeSlot} ({(b.durationMinutes || 60)} min)</div>
@@ -798,7 +802,7 @@ const MyBookings: React.FC<{ client: Client, onBack: () => void, onReschedule: (
                                                 <button onClick={() => onReschedule(b)} className="text-sm text-[#007AFF] font-medium hover:bg-[#007AFF]/5 px-3 py-1.5 rounded-full transition-colors flex items-center gap-1">
                                                     Reschedule
                                                 </button>
-                                                <button onClick={() => handleCancel(b.id)} className="text-sm text-[#FF3B30] font-medium hover:bg-[#FF3B30]/5 px-3 py-1.5 rounded-full transition-colors">
+                                                <button onClick={() => setCancelTarget(b)} className="text-sm text-[#FF3B30] font-medium hover:bg-[#FF3B30]/5 px-3 py-1.5 rounded-full transition-colors">
                                                     Cancel
                                                 </button>
                                             </div>
@@ -810,6 +814,15 @@ const MyBookings: React.FC<{ client: Client, onBack: () => void, onReschedule: (
                     </div>
                 )}
             </div>
+            <ConfirmDialog
+                open={cancelTarget !== null}
+                title="Cancel appointment?"
+                message={cancelTarget ? `${cancelTarget.serviceName} on ${format(parseDay(cancelTarget.date), 'MMM d')} at ${cancelTarget.timeSlot} will be cancelled.` : ''}
+                confirmLabel="Cancel appointment"
+                destructive
+                onConfirm={handleCancelConfirmed}
+                onCancel={() => setCancelTarget(null)}
+            />
         </div>
     )
 }

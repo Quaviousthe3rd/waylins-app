@@ -1,5 +1,6 @@
+// Online is the only live payment path (the cash flow was deliberately
+// killed — owner's decision). The enum stays for typing legacy booking docs.
 export enum PaymentMethod {
-  CASH = 'Cash at Shop',
   ONLINE = 'Online (Paystack)'
 }
 

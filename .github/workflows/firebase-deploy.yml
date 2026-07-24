@@ -14,6 +14,17 @@ jobs:
           cache: 'npm'
       - name: Install dependencies
         run: npm install
+      # Quality gates — ALL run before the deploy step so a type error or a
+      # red test blocks the deploy entirely.
+      - name: Type-check frontend
+        run: npx tsc --noEmit
+      - name: Type-check and build Cloud Functions
+        # The root tsconfig excludes functions/ (its deps aren't installed at
+        # root), so the payment code MUST be compiled here or a type error in
+        # money-path code would sail through CI.
+        run: cd functions && npm ci && npm run build
+      - name: Run tests
+        run: npm test
       - name: Build project
         run: npm run build
         env:

@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "vitest run"
   },
   "dependencies": {
     "@paystack/inline-js": "^2.23.1",
@@ -29,6 +30,7 @@
     "postcss": "^8.5.22",
     "tailwindcss": "^3.4.19",
     "typescript": "^5.2.2",
-    "vite": "^5.1.4"
+    "vite": "^5.1.4",
+    "vitest": "^4.1.10"
   }
 }

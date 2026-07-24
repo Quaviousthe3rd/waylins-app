@@ -40,8 +40,7 @@ export const Pricing: React.FC = () => {
         <div className="mt-12 p-6 bg-white rounded-2xl">
           <h2 className="text-xl font-bold text-[#1C1C1E] mb-4">Payment Options</h2>
           <ul className="space-y-2 text-[#8E8E93]">
-            <li>• Pay online securely via Paystack (full payment or 50% deposit)</li>
-            <li>• Pay cash at the shop on arrival</li>
+            <li>• Pay online securely via Paystack when you book</li>
             <li>• All prices are in South African Rand (ZAR)</li>
           </ul>
         </div>
