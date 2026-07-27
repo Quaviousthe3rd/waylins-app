@@ -119,6 +119,7 @@ let paymentEnvPromise: Promise<PaymentEnv> | null = null;
 
 // Server-computed quote for a service. The server (quoteService) is the
 // single source of truth for pricing — the client never computes amounts.
+// serviceFee is the flat R50 booking fee added to every service.
 export interface ServiceQuote {
     base: number;
     serviceFee: number;
@@ -160,6 +161,12 @@ const fetchPaymentEnv = async (): Promise<PaymentEnv> => {
 // Amounts are RAND. paystackFeeActual comes from the Paystack event and may
 // be null; estimatedFee is our own calculation — the UI must label which
 // one it is showing, never present an estimate as fact.
+//
+// Money model (flat R50): charged = base + R50; ownerCut = 10% of base;
+// barberNet is what Paystack's split ROUTED to the barber (computed from the
+// estimated fee), barberNetActual is what the barber is actually owed once
+// the real fee is known, and barberDrift = barberNetActual - barberNet is the
+// difference the owner settles off-platform. Older rows have these as null.
 export interface LedgerRow {
     id: string;               // doc id == payment reference
     reference: string;
@@ -170,9 +177,13 @@ export interface LedgerRow {
     date: string | null;      // booking date yyyy-MM-dd
     timeSlot: string | null;
     charged: number | null;   // gross amount the client paid (rand)
+    base: number | null;      // service base price (charged - R50)
+    ownerCut: number | null;  // exactly 10% of base
     paystackFeeActual: number | null;
     estimatedFee: number | null;
-    barberNet: number | null;
+    barberNet: number | null;        // routed by Paystack (estimate-based)
+    barberNetActual: number | null;  // owed to the barber (actual fee)
+    barberDrift: number | null;      // actual - routed; owner settles this
     refundedAmount: number | null;
     bookingId: string | null;
     createdAt: Date | null;   // transaction time (webhook processing time)
@@ -272,9 +283,13 @@ export const api = {
               date: r.date ? String(r.date) : null,
               timeSlot: r.timeSlot ? String(r.timeSlot) : null,
               charged: num(r.charged),
+              base: num(r.base),
+              ownerCut: num(r.ownerCut),
               paystackFeeActual: num(r.paystackFeeActual),
               estimatedFee: num(r.estimatedFee),
               barberNet: num(r.barberNet),
+              barberNetActual: num(r.barberNetActual),
+              barberDrift: num(r.barberDrift),
               refundedAmount: num(r.refundedAmount),
               bookingId: r.bookingId ? String(r.bookingId) : null,
               createdAt: r.createdAt?.toDate ? r.createdAt.toDate() : null,

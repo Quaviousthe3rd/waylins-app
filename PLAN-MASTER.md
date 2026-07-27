@@ -11,7 +11,7 @@
 - Trust boundary: Firestore rules deployed, real Firebase Auth admin login, forgeable localStorage session removed.
 - Server owns money: `initTransaction` computes every amount from Firestore config. The browser cannot invent a price.
 - Payments verified: `paystackWebhook` checks the HMAC signature, writes the booking with the Admin SDK, writes a cent-exact ledger row. Idempotent on reference.
-- Split model live and reconciled on a real transaction: owner cut exactly 10% of base, all rounding surplus to the barber, Paystack fee off the owner side.
+- Money model (owner-approved 2026-07-27, replaces the old grossed-up split): customer pays **base + flat R50** on every service; owner receives **exactly 10% of base**; barber receives **base + (R50 - Paystack fee - owner cut)**. The R50 is the only thing the fee and the owner cut come out of, and the barber keeps every cent left. Paystack's rate is never hardcoded — the split call uses an estimate (`feePercent`/`feeFlatRand`), settlement records the **actual** fee Paystack reports and the exact barber figure, and the statement shows the drift between the two. A base price where R50 cannot cover fee + owner cut is **refused** at `initTransaction` (see A2 for the current threshold), never silently underpaid.
 - Test mode: environment-switched via `settings/paymentConfig.mode`, verified end to end with a test card.
 - Telegram: notifications land in the shared group after verified payment.
 
@@ -34,12 +34,14 @@ The trailing-space incident silently armed live mode with no public key, and a c
 - Log and reject unrecognised field names on the config doc (this is what would have caught `"mode "` immediately).
 
 ### A2. Fee percentage, owner decides
-Paystack charged roughly 3.39% in test versus the configured 2.9% plus R1. By design the shortfall comes off the owner's side, so a R290 charge nets R23.58 instead of R25.00.
+Under the flat-R50 model the configured rate no longer decides anyone's payout — settlement uses the **actual** fee Paystack reports, so a wrong rate only shows up as drift on the statement (Paystack routed the estimate; the owner settles the difference with the barber). Two things still depend on the configured rate:
+- the estimated `transaction_charge` sent to Paystack, so a closer rate means smaller drift;
+- the **underpay threshold**: with 2.9% + R1 the highest base price the R50 can carry is **R368.64** (at that price the owner's R36.86 + the R13.14 estimated fee is exactly R50). Above it `initTransaction` refuses the booking with a Telegram alert. The whole current menu (R80–R300) is under it. A worse rate lowers the threshold.
 - **Blocked on:** the owner's real contracted live rate, read off the live Paystack dashboard. Do not use the test-mode figure and do not use any model-estimated rate.
-- Once known, update `feePercent` and `feeFlatRand` in `settings/paymentConfig`. No deploy needed.
+- Once known, update `feePercent` and `feeFlatRand` in `settings/paymentConfig`. No deploy needed. `quoteService` returns `maxSafeBase` so the new threshold can be read straight back.
 
 ### A3. Split preview tool (the owner may change the split model)
-Add an admin-only callable `previewSplit({ feePercent, feeFlat, roundTo, barberBuffer, ownerPercent })` that returns the full table for every service in the catalog: base, charge, service fee, owner cut, estimated fee, barber net. Read-only, changes nothing.
+Add an admin-only callable `previewSplit({ feePercent, feeFlat, ownerPercent, flatFee })` that returns the full table for every service in the catalog: base, charge, flat fee, owner cut, estimated fee, barber net. Read-only, changes nothing.
 Purpose: the owner can model a different split (different percentage, different buffer, percentage-of-total versus percentage-of-base) and see the exact rand outcome per service before committing. Surface it in the admin portal as a simple table when convenient.
 
 ### A4. Go live

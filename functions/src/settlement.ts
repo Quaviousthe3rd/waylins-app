@@ -1,5 +1,6 @@
 import { getFirestore, FieldValue } from "firebase-admin/firestore";
 import { PaymentMode, escapeHTML, sendTelegram } from "./telegram";
+import { computeActualSplit } from "./money";
 
 // --- Shared settlement core (Phase D) ---
 // ONE function turns a successful Paystack charge into a booking + ledger
@@ -190,8 +191,11 @@ export const settleCharge = async (
           // quote left to compare against, so the amount check self-passes.
           amountCents: chargedCents,
           totalRand: randFromCents(chargedCents),
+          basePriceRand: typeof md.baseAmount === "number" ? md.baseAmount : null,
+          ownerCutRand: typeof md.ownerCut === "number" ? md.ownerCut : null,
           barberNetRand: typeof md.barberNet === "number" ? md.barberNet : null,
-          estimatedFeeRand: null,
+          estimatedFeeRand:
+            typeof md.estimatedFee === "number" ? md.estimatedFee : null,
         },
       };
     }
@@ -253,11 +257,42 @@ export const settleCharge = async (
     date: String(b.date ?? ""),
     timeSlot: String(b.timeSlot ?? ""),
   };
+  // --- Exact money, from the ACTUAL fee Paystack reported ---
+  // The split Paystack already performed used the ESTIMATED fee, so the exact
+  // barber figure (base + R50 - actualFee - ownerCut) can differ by a few
+  // cents. Both are stored, plus the drift, so the statement can show it and
+  // the owner can settle the difference. A rate change on Paystack's side
+  // changes only the drift — nothing here assumes a rate.
+  const centsOf = (rand: any): number | null =>
+    typeof rand === "number" && Number.isFinite(rand) ? Math.round(rand * 100) : null;
+  const ownerCutCents =
+    typeof amounts.ownerCutCents === "number"
+      ? amounts.ownerCutCents
+      : centsOf(amounts.ownerCutRand);
+  const barberNetRoutedCents = centsOf(amounts.barberNetRand);
+  const actualFeeCents = data.fees != null ? Number(data.fees) || 0 : null;
+  const split =
+    actualFeeCents !== null && ownerCutCents !== null && barberNetRoutedCents !== null
+      ? computeActualSplit(
+          chargedCents,
+          ownerCutCents,
+          actualFeeCents,
+          barberNetRoutedCents
+        )
+      : null;
+
   const ledgerFull = {
     ...ledgerBase,
     ...bookingFields,
+    base: amounts.basePriceRand ?? null,
+    ownerCut: ownerCutCents !== null ? randFromCents(ownerCutCents) : null,
     estimatedFee: amounts.estimatedFeeRand ?? null,
+    // What Paystack routed to the subaccount (estimate-based).
     barberNet: amounts.barberNetRand ?? null,
+    // What the barber is owed once the real fee is known, and the difference.
+    barberNetActual: split ? randFromCents(split.barberNetActualCents) : null,
+    barberDrift: split ? randFromCents(split.barberDriftCents) : null,
+    ownerNet: split ? randFromCents(split.ownerNetCents) : null,
     ...(recovered ? { recoveredFromMetadata: true } : {}),
   };
   const result = {

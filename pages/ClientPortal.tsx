@@ -596,7 +596,7 @@ const BookingWizard: React.FC<BookingWizardProps> = ({
                                         <span>R{quote.base}</span>
                                     </div>
                                     <div className="flex justify-between">
-                                        <span>Service Fee</span>
+                                        <span>Booking fee (flat)</span>
                                         <span>R{quote.serviceFee}</span>
                                     </div>
                                 </div>

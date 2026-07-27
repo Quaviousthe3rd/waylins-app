@@ -53,6 +53,8 @@ const KNOWN_PAYMENT_CONFIG_FIELDS = new Set([
   "subaccountCode",
   "feePercent",
   "feeFlatRand",
+  // Legacy fields from the grossed-up model; ignored by the flat-R50 model
+  // but still tolerated on the existing doc so validation stays quiet.
   "roundToRand",
   "barberBufferRand",
 ]);
@@ -131,7 +133,12 @@ export const ping = onRequest(
 
 // Money model lives in money.ts (pure, unit-tested) — see that file for the
 // full split documentation.
-import { computeQuote, readFeeConfig } from "./money";
+import {
+  computeQuote,
+  readFeeConfig,
+  maxSafeBaseCents,
+  FLAT_SERVICE_FEE_CENTS,
+} from "./money";
 
 // --- Slot claims (B2: atomic double-booking prevention) ---
 // slotClaims/{date}_{HH:mm}: one doc per 30-minute grid cell. A booking that
@@ -290,11 +297,26 @@ export const initTransaction = onCall(
     const paySnap = await db.doc("settings/paymentConfig").get();
     const { mode, subaccountCode } = await validatePaymentConfig(paySnap.data());
 
-    // 5. Amounts.
-    const quote = computeQuote(Math.round(basePriceRand * 100), readFeeConfig(paySnap.data()));
-    if (quote.barberNetCents < quote.baseCents) {
-      // Should be impossible by construction; refuse rather than short the barber.
-      throw new HttpsError("internal", "Pricing configuration error.");
+    // 5. Amounts. Flat R50 on top of the base; the R50 carries the Paystack
+    //    fee and the owner's 10%, the barber keeps the base plus the rest.
+    const feeCfg = readFeeConfig(paySnap.data());
+    const quote = computeQuote(Math.round(basePriceRand * 100), feeCfg);
+    // UNDERPAY GUARD. A cut priced high enough that R50 cannot cover the
+    // Paystack fee plus the owner's 10% must NOT be sold: the barber would
+    // net less than the base price. Refuse loudly instead of shorting them.
+    if (quote.underpaysBarber) {
+      const maxBase = maxSafeBaseCents(feeCfg);
+      console.error(
+        `UNDERPAY_REFUSED ${service.name}: base ${quote.baseCents}c, ownerCut ${quote.ownerCutCents}c + estFee ${quote.estimatedFeeCents}c > flat ${FLAT_SERVICE_FEE_CENTS}c (max safe base ${maxBase}c)`
+      );
+      await sendThrottledAlert(
+        "underpay",
+        `🚨 <b>Booking refused — R50 cannot cover fee + owner cut</b>\nService: ${escapeHTML(service.name)} at R${basePriceRand}\nOwner cut R${randFromCents(quote.ownerCutCents)} + estimated Paystack fee R${randFromCents(quote.estimatedFeeCents)} exceeds the R${randFromCents(FLAT_SERVICE_FEE_CENTS)} flat fee, so the barber would receive LESS than R${basePriceRand}.\nHighest base price the flat R50 can carry right now: <b>R${randFromCents(maxBase)}</b>.\nRaise the flat fee or lower this service's price — online booking for it is disabled until then.`
+      );
+      throw new HttpsError(
+        "failed-precondition",
+        "This service can't be booked online right now. Please call the shop to book it."
+      );
     }
 
     // 6. ATOMICALLY claim every 30-min cell the service covers, BEFORE the
@@ -365,9 +387,13 @@ export const initTransaction = onCall(
         ownerCutRand: randFromCents(quote.ownerCutCents),
         serviceFeeRand: randFromCents(quote.serviceFeeCents),
         totalRand: randFromCents(quote.chargeCents),
+        // What Paystack's split will actually route to the barber (based on
+        // the ESTIMATED fee — settlement recomputes the exact figure).
         barberNetRand: randFromCents(quote.barberNetCents),
         estimatedFeeRand: randFromCents(quote.estimatedFeeCents),
         amountCents: quote.chargeCents,
+        baseCents: quote.baseCents,
+        ownerCutCents: quote.ownerCutCents,
         transactionChargeCents: quote.transactionChargeCents,
       },
       createdAt: FieldValue.serverTimestamp(),
@@ -375,6 +401,11 @@ export const initTransaction = onCall(
 
     // 8. Initialize the Paystack transaction. NOTE: subaccount split with a
     //    flat transaction_charge; SPL_ split codes are deliberately not used.
+    //    transaction_charge = ownerCut + ESTIMATED fee with bearer "account",
+    //    so the fee is taken off the owner/main side and the subaccount
+    //    receives base + (R50 - estimatedFee - ownerCut). The estimate is
+    //    unavoidable here — Paystack needs the split before it knows its own
+    //    fee — so settlement records the ACTUAL fee and the resulting drift.
     //    In test mode the split params are omitted (no real subaccount) and
     //    the test secret key is used; everything else is identical.
     const resp = await fetch("https://api.paystack.co/transaction/initialize", {
@@ -408,6 +439,7 @@ export const initTransaction = onCall(
           serviceFee: randFromCents(quote.serviceFeeCents),
           ownerCut: randFromCents(quote.ownerCutCents),
           barberNet: randFromCents(quote.barberNetCents),
+          estimatedFee: randFromCents(quote.estimatedFeeCents),
         },
       }),
     });
@@ -452,16 +484,20 @@ export const quoteService = onCall(
   const paySnap = await db.doc("settings/paymentConfig").get();
   // Fail loud on a broken config before quoting a price for it.
   await validatePaymentConfig(paySnap.data());
-  const quote = computeQuote(
-    Math.round(Number(service.price) * 100),
-    readFeeConfig(paySnap.data())
-  );
+  const feeCfg = readFeeConfig(paySnap.data());
+  const quote = computeQuote(Math.round(Number(service.price) * 100), feeCfg);
   return {
     base: randFromCents(quote.baseCents),
+    // Flat R50 on every service — the label the client UI shows.
     serviceFee: randFromCents(quote.serviceFeeCents),
     total: randFromCents(quote.chargeCents),
+    // Estimated split (the exact barber figure is only known at settlement).
     barberNet: randFromCents(quote.barberNetCents),
     ownerCut: randFromCents(quote.ownerCutCents),
+    estimatedFee: randFromCents(quote.estimatedFeeCents),
+    // The wizard must not offer a service the flat fee cannot carry.
+    bookable: !quote.underpaysBarber,
+    maxSafeBase: randFromCents(maxSafeBaseCents(feeCfg)),
   };
   }
 );

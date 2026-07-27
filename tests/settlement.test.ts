@@ -31,21 +31,26 @@ const seedPendingIntent = () => {
       date: '2026-07-27',
       timeSlot: '10:00',
     },
+    // Flat-R50 model: R200 cut -> R250 charged, owner cut R20, estimated fee
+    // R8.25, so Paystack routes R221.75 to the barber.
     amounts: {
       currency: 'ZAR',
-      amountCents: 23500,
-      totalRand: 235,
-      barberNetRand: 207.18,
-      estimatedFeeRand: 7.82,
+      amountCents: 25000,
+      totalRand: 250,
+      basePriceRand: 200,
+      ownerCutRand: 20,
+      ownerCutCents: 2000,
+      barberNetRand: 221.75,
+      estimatedFeeRand: 8.25,
     },
   });
 };
 
 const chargeData = {
   reference: REF,
-  amount: 23500,
+  amount: 25000,
   id: 4242,
-  fees: 796,
+  fees: 796, // ACTUAL fee Paystack reported — less than the R8.25 estimate
   metadata: {},
 };
 
@@ -69,7 +74,25 @@ describe('settlement idempotency', () => {
 
     const ledger = __store.get(`ledger/${REF}`)!;
     expect(ledger.status).toBe('PAID_BOOKED');
-    expect(ledger.charged).toBe(235);
+    expect(ledger.charged).toBe(250);
+  });
+
+  it('records the ACTUAL Paystack fee and the exact barber figure, with drift', () => {
+    return settleCharge(chargeData, 'test', 'webhook', rawEvent).then(() => {
+      const l = __store.get(`ledger/${REF}`)!;
+      expect(l.base).toBe(200);
+      expect(l.ownerCut).toBe(20);
+      expect(l.paystackFeeActual).toBe(7.96); // actual, not the R8.25 estimate
+      expect(l.estimatedFee).toBe(8.25);
+      expect(l.barberNet).toBe(221.75); // what the split routed
+      expect(l.barberNetActual).toBe(222.04); // 250 - 7.96 - 20
+      expect(l.barberDrift).toBe(0.29); // owner owes the barber 29c
+      expect(l.ownerNet).toBe(20); // owner still gets exactly 10% of base
+      // Exact decomposition of the charge.
+      expect(
+        Math.round((l.barberNetActual + l.ownerNet + l.paystackFeeActual) * 100)
+      ).toBe(25000);
+    });
   });
 
   it('settling the SAME reference twice produces exactly one ledger row and one booking', async () => {

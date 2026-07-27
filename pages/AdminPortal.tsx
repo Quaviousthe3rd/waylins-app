@@ -808,38 +808,57 @@ const toCents = (rand: number | null): number | null =>
     rand === null ? null : Math.round(rand * 100);
 const fmtRand = (cents: number): string => `R${(cents / 100).toFixed(2)}`;
 
+// Flat-R50 model: charged = base + R50, ownerCut = 10% of base, and the
+// barber keeps base + (R50 - fee - ownerCut). barberNetC is the EXACT figure
+// (from Paystack's actual fee) when the row has it; barberRoutedC is what the
+// split already moved using the estimated fee, and driftC is the difference
+// the owner still owes (positive) or over-paid (negative).
 interface StatementRow {
     row: LedgerRow;
     chargedC: number | null;
+    baseC: number | null;
     feeC: number | null;
     feeIsActual: boolean;      // false = ESTIMATED fee shown — labelled in UI
-    ownerCutC: number | null;  // derived: charged - fee - barberNet
-    barberNetC: number | null;
+    ownerCutC: number | null;  // stored 10% of base (legacy rows: derived)
+    barberNetC: number | null; // what the barber is owed
+    barberRoutedC: number | null;
+    driftC: number | null;
     isAnomaly: boolean;
     // A PAID/REFUNDED row whose components don't decompose to the charged
     // amount. Flagged visually, never silently hidden.
     broken: boolean;
 }
 
-interface Totals { charged: number; fees: number; ownerCut: number; barberNet: number; }
-const zeroTotals = (): Totals => ({ charged: 0, fees: 0, ownerCut: 0, barberNet: 0 });
+interface Totals { charged: number; fees: number; ownerCut: number; barberNet: number; drift: number; }
+const zeroTotals = (): Totals => ({ charged: 0, fees: 0, ownerCut: 0, barberNet: 0, drift: 0 });
 
 const deriveRow = (row: LedgerRow): StatementRow => {
     const chargedC = toCents(row.charged);
     const feeIsActual = row.paystackFeeActual !== null;
     const feeC = toCents(row.paystackFeeActual ?? row.estimatedFee);
-    const barberNetC = toCents(row.barberNet);
+    const barberRoutedC = toCents(row.barberNet);
+    // Exact figure when we have it; otherwise the routed amount is the best
+    // available truth (and pre-flat-fee rows only ever have that).
+    const barberNetC = toCents(row.barberNetActual) ?? barberRoutedC;
     const ownerCutC =
-        chargedC !== null && feeC !== null && barberNetC !== null
+        toCents(row.ownerCut) ??
+        (chargedC !== null && feeC !== null && barberNetC !== null
             ? chargedC - feeC - barberNetC
-            : null;
+            : null);
+    const driftC =
+        toCents(row.barberDrift) ??
+        (barberNetC !== null && barberRoutedC !== null ? barberNetC - barberRoutedC : null);
+    const baseC = toCents(row.base);
     const isAnomaly = ANOMALY_STATUSES.has(row.status);
     const broken =
         !isAnomaly &&
         (chargedC === null || feeC === null || barberNetC === null ||
          ownerCutC === null || ownerCutC < 0 ||
          feeC + ownerCutC + barberNetC !== chargedC);
-    return { row, chargedC, feeC, feeIsActual, ownerCutC, barberNetC, isAnomaly, broken };
+    return {
+        row, chargedC, baseC, feeC, feeIsActual, ownerCutC,
+        barberNetC, barberRoutedC, driftC, isAnomaly, broken,
+    };
 };
 
 // REFUNDED rows are shown but SUBTRACTED from totals; anomaly and broken
@@ -853,6 +872,7 @@ const addToTotals = (t: Totals, r: StatementRow): void => {
     t.fees += sign * (r.feeC ?? 0);
     t.ownerCut += sign * (r.ownerCutC ?? 0);
     t.barberNet += sign * (r.barberNetC ?? 0);
+    t.drift += sign * (r.driftC ?? 0);
 };
 
 // --- Manual settle (Phase D layer 3) ---
@@ -1050,10 +1070,11 @@ const StatementTab: React.FC = () => {
     const totalsStrip = (t: Totals, label: string) => (
         <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-sm">
             {[
-                ['Charged', t.charged],
+                ['Charged (base + R50)', t.charged],
                 ['Paystack fees', t.fees],
-                ['Owner cut', t.ownerCut],
-                ['Barber net', t.barberNet],
+                ['Owner cut (10% of base)', t.ownerCut],
+                ['Barber owed', t.barberNet],
+                ...(t.drift !== 0 ? [['Owed to barber (fee drift)', t.drift]] : []),
             ].map(([name, cents]) => (
                 <div key={String(name)} className="bg-[#F2F2F7] rounded-xl p-3">
                     <div className="text-[10px] font-bold text-[#8E8E93] uppercase tracking-widest">{name} · {label}</div>
@@ -1089,10 +1110,19 @@ const StatementTab: React.FC = () => {
                 </div>
             </div>
             <div className="mt-2 flex flex-wrap gap-x-5 gap-y-1 text-[12px] text-[#8E8E93]">
+                <span>Cut price: {r.baseC !== null ? fmtRand(r.baseC) : '—'}</span>
                 <span>Fee: {r.feeC !== null ? fmtRand(r.feeC) : '—'} <em className="not-italic font-semibold">({r.feeIsActual ? 'actual' : 'ESTIMATED'})</em></span>
-                <span>Owner cut: {r.ownerCutC !== null ? fmtRand(r.ownerCutC) : '—'}</span>
-                <span>Barber net: {r.barberNetC !== null ? fmtRand(r.barberNetC) : '—'}</span>
+                <span>Owner cut (10%): {r.ownerCutC !== null ? fmtRand(r.ownerCutC) : '—'}</span>
+                <span>Barber owed: {r.barberNetC !== null ? fmtRand(r.barberNetC) : '—'}</span>
             </div>
+            {r.driftC !== null && r.driftC !== 0 && (
+                <div className="mt-1 text-[12px] text-[#8E8E93]">
+                    Paystack routed {r.barberRoutedC !== null ? fmtRand(r.barberRoutedC) : '—'} to the barber
+                    (estimated fee) — {r.driftC > 0
+                        ? <>owner still owes the barber <strong className="text-[#1C1C1E]">{fmtRand(r.driftC)}</strong></>
+                        : <>owner over-paid the barber by <strong className="text-[#1C1C1E]">{fmtRand(-r.driftC)}</strong></>}.
+                </div>
+            )}
             {r.broken && (
                 <div className="mt-2 text-[12px] font-semibold text-[#FF3B30] flex items-center gap-1.5">
                     <AlertTriangle size={14} /> Components do not sum to the charged amount — excluded from totals. Reconcile manually.
@@ -1191,7 +1221,7 @@ const StatementTab: React.FC = () => {
                                 </div>
                                 <div className="text-right text-sm">
                                     <div className="font-bold text-[#1C1C1E]">{fmtRand(groupTotals.charged)}</div>
-                                    <div className="text-[11px] text-[#8E8E93]">barber net {fmtRand(groupTotals.barberNet)}</div>
+                                    <div className="text-[11px] text-[#8E8E93]">barber owed {fmtRand(groupTotals.barberNet)}</div>
                                 </div>
                             </button>
                             {open && (
