@@ -23,6 +23,7 @@ import {
   deleteDoc,
   query,
   where,
+  getDoc,
   getDocs,
   orderBy,
   Timestamp,
@@ -37,7 +38,10 @@ import {
 } from 'firebase/auth';
 import { getFunctions, httpsCallable } from 'firebase/functions';
 
-const ADMIN_EMAIL = 'qaabilmullah@gmail.com';
+// Admin identity lives in settings/adminConfig.adminEmails — see firestore.rules.
+// There is deliberately no email constant here: a second hardcoded address is
+// exactly what this replaces.
+const ADMIN_CONFIG_DOC = 'adminConfig';
 
 // --- CONFIGURATION ---
 const firebaseConfig = {
@@ -55,7 +59,28 @@ let auth: Auth | null = null;
 let currentUser: User | null = null;
 let firebaseApp: any = null;
 
-const isAdminUser = (user: User | null) => !!user && user.email === ADMIN_EMAIL;
+// Is this signed-in user an admin? The rules make settings/adminConfig
+// readable ONLY by admins, so the read attempt IS the test — it is the same
+// allowlist the server enforces, so the UI can never disagree with the
+// database. Denied read (or any failure) => not an admin. We still verify
+// the email is in the returned list, so a future rules relaxation cannot
+// silently widen the client gate.
+const isAdminUser = async (user: User | null): Promise<boolean> => {
+    if (!user || !user.email || !db) return false;
+    try {
+        const snap = await getDoc(doc(db, 'settings', ADMIN_CONFIG_DOC));
+        if (!snap.exists()) return false;
+        const emails = snap.data()?.adminEmails;
+        if (!Array.isArray(emails)) return false;
+        return emails
+            .filter((e: unknown): e is string => typeof e === 'string')
+            .map(e => e.toLowerCase())
+            .includes(user.email.toLowerCase());
+    } catch {
+        // permission-denied is the expected path for a non-admin sign-in.
+        return false;
+    }
+};
 
 try {
     // Only initialize if keys are present to avoid errors during setup
@@ -445,11 +470,10 @@ export const api = {
                     // Config doc missing. Only the admin may seed it — the rules
                     // deny settings writes to everyone else, so a client-side
                     // write here would fail-loop for normal visitors.
-                    if (isAdminUser(currentUser)) {
-                        setDoc(configRef, INITIAL_CONFIG).catch(console.error);
-                    } else {
-                        configCache = INITIAL_CONFIG;
-                    }
+                    configCache = INITIAL_CONFIG;
+                    isAdminUser(currentUser).then(admin => {
+                        if (admin) setDoc(configRef, INITIAL_CONFIG).catch(console.error);
+                    }).catch(console.error);
                 }
                 notifyListeners();
             });
@@ -472,7 +496,7 @@ export const api = {
   login: async (email: string, password: string): Promise<boolean> => {
     if (!auth) throw new Error("Authentication not available. Check Firebase configuration.");
     const cred = await signInWithEmailAndPassword(auth, email, password);
-    if (cred.user.email !== ADMIN_EMAIL) {
+    if (!(await isAdminUser(cred.user))) {
         await signOut(auth);
         return false;
     }
@@ -483,13 +507,31 @@ export const api = {
     if (auth) await signOut(auth);
   },
 
-  // Subscribe to auth state; callback receives true when the admin is signed in.
+  // Subscribe to auth state; callback receives true when an allowlisted admin
+  // is signed in. The allowlist check is a Firestore read, so it is async — a
+  // sequence counter drops stale answers when auth changes mid-flight (e.g.
+  // sign-out landing while the previous user's lookup is still in the air).
   onAuthChanged: (callback: (isAdmin: boolean) => void): (() => void) => {
     if (!auth) {
         callback(false);
         return () => {};
     }
-    return onAuthStateChanged(auth, (user) => callback(isAdminUser(user)));
+    let seq = 0;
+    let cancelled = false;
+    const unsubscribe = onAuthStateChanged(auth, (user) => {
+        const mine = ++seq;
+        isAdminUser(user)
+            .then(admin => {
+                if (!cancelled && mine === seq) callback(admin);
+            })
+            .catch(() => {
+                if (!cancelled && mine === seq) callback(false);
+            });
+    });
+    return () => {
+        cancelled = true;
+        unsubscribe();
+    };
   },
 
   // --- READ OPERATIONS ---

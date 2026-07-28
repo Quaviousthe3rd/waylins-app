@@ -1233,7 +1233,30 @@ export const reconcileSweep = onSchedule(
 //                   NOTHING.
 //   confirm:true  → settle via the SAME shared settleCharge as the webhook
 //                   and the sweep. Idempotent on the reference.
-// Admin-only: requires Firebase Auth (only admins can sign in).
+// Admin-only, enforced against the SAME settings/adminConfig allowlist the
+// firestore rules use. "Has a Firebase Auth account" is not the same thing as
+// "is an admin", so being signed in is necessary but not sufficient.
+// Returns the verified admin email so callers can record WHICH admin acted —
+// with more than one admin, "an admin did it" is no longer enough of an audit
+// trail.
+const requireAdmin = async (
+  auth: { token?: { email?: string } } | undefined
+): Promise<string> => {
+  const email = auth?.token?.email;
+  if (!email) {
+    throw new HttpsError("unauthenticated", "Admin sign-in required.");
+  }
+  const cfg = (await db.doc("settings/adminConfig").get()).data();
+  const list = Array.isArray(cfg?.adminEmails) ? cfg!.adminEmails : [];
+  const allowed = list
+    .filter((e: unknown): e is string => typeof e === "string")
+    .map((e: string) => e.toLowerCase());
+  if (!allowed.includes(email.toLowerCase())) {
+    throw new HttpsError("permission-denied", "Admin access required.");
+  }
+  return email;
+};
+
 export const manualSettle = onCall(
   {
     secrets: [
@@ -1244,9 +1267,7 @@ export const manualSettle = onCall(
     ],
   },
   async (request) => {
-    if (!request.auth) {
-      throw new HttpsError("unauthenticated", "Admin sign-in required.");
-    }
+    const adminEmail = await requireAdmin(request.auth);
     const { reference, confirm } = request.data ?? {};
     if (typeof reference !== "string" || !/^[\w-]{4,100}$/.test(reference.trim())) {
       throw new HttpsError("invalid-argument", "A valid reference is required.");
@@ -1311,11 +1332,12 @@ export const manualSettle = onCall(
       event: "charge.success",
       data: found,
       via: "manualSettle",
-      by: request.auth.uid,
+      by: request.auth?.uid ?? null,
+      byEmail: adminEmail,
     });
     if (result.status !== "ALREADY_SETTLED") {
       await sendTelegram(
-        `🛠️ <b>Admin manually settled a payment</b>\nReference: <code>${escapeHTML(ref)}</code>\nOutcome: ${escapeHTML(result.status)}\nAmount: R${result.amountRand}${result.recoveredFromMetadata ? "\nBooking rebuilt from Paystack metadata." : ""}`,
+        `🛠️ <b>Admin manually settled a payment</b>\nBy: ${escapeHTML(adminEmail)}\nReference: <code>${escapeHTML(ref)}</code>\nOutcome: ${escapeHTML(result.status)}\nAmount: R${result.amountRand}${result.recoveredFromMetadata ? "\nBooking rebuilt from Paystack metadata." : ""}`,
         foundMode
       );
     }
