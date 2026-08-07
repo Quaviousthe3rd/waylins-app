@@ -840,7 +840,12 @@ const deriveRow = (row: LedgerRow): StatementRow => {
     // Exact figure when we have it; otherwise the routed amount is the best
     // available truth (and pre-flat-fee rows only ever have that).
     const barberNetC = toCents(row.barberNetActual) ?? barberRoutedC;
+    // What the owner ACTUALLY kept. ownerNet already carries the fee drift
+    // (it is ownerCut + barberDrift); ownerCut is the 10%-of-base entitlement
+    // and equals ownerNet only when the fee estimate was exact. The statement
+    // has to match the bank, so actual money wins where it is recorded.
     const ownerCutC =
+        toCents(row.ownerNet) ??
         toCents(row.ownerCut) ??
         (chargedC !== null && feeC !== null && barberNetC !== null
             ? chargedC - feeC - barberNetC
@@ -1072,9 +1077,9 @@ const StatementTab: React.FC = () => {
             {[
                 ['Charged (base + R50)', t.charged],
                 ['Paystack fees', t.fees],
-                ['Owner cut (10% of base)', t.ownerCut],
-                ['Barber owed', t.barberNet],
-                ...(t.drift !== 0 ? [['Owed to barber (fee drift)', t.drift]] : []),
+                ['Owner net (10% of base ± fee drift)', t.ownerCut],
+                ['Barber paid', t.barberNet],
+                ...(t.drift !== 0 ? [['Fee drift (absorbed by owner)', t.drift]] : []),
             ].map(([name, cents]) => (
                 <div key={String(name)} className="bg-[#F2F2F7] rounded-xl p-3">
                     <div className="text-[10px] font-bold text-[#8E8E93] uppercase tracking-widest">{name} · {label}</div>
@@ -1112,8 +1117,8 @@ const StatementTab: React.FC = () => {
             <div className="mt-2 flex flex-wrap gap-x-5 gap-y-1 text-[12px] text-[#8E8E93]">
                 <span>Cut price: {r.baseC !== null ? fmtRand(r.baseC) : '—'}</span>
                 <span>Fee: {r.feeC !== null ? fmtRand(r.feeC) : '—'} <em className="not-italic font-semibold">({r.feeIsActual ? 'actual' : 'ESTIMATED'})</em></span>
-                <span>Owner cut (10%): {r.ownerCutC !== null ? fmtRand(r.ownerCutC) : '—'}</span>
-                <span>Barber owed: {r.barberNetC !== null ? fmtRand(r.barberNetC) : '—'}</span>
+                <span>Owner net: {r.ownerCutC !== null ? fmtRand(r.ownerCutC) : '—'}</span>
+                <span>Barber paid: {r.barberNetC !== null ? fmtRand(r.barberNetC) : '—'}</span>
             </div>
             {r.driftC !== null && r.driftC !== 0 && (
                 <div className="mt-1 text-[12px] text-[#8E8E93]">

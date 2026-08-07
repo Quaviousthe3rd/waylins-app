@@ -187,11 +187,14 @@ const fetchPaymentEnv = async (): Promise<PaymentEnv> => {
 // be null; estimatedFee is our own calculation — the UI must label which
 // one it is showing, never present an estimate as fact.
 //
-// Money model (flat R50): charged = base + R50; ownerCut = 10% of base;
+// Money model (flat R50): charged = base + R50; ownerCut = 10% of base.
 // barberNet is what Paystack's split ROUTED to the barber (computed from the
-// estimated fee), barberNetActual is what the barber is actually owed once
-// the real fee is known, and barberDrift = barberNetActual - barberNet is the
-// difference the owner settles off-platform. Older rows have these as null.
+// ESTIMATED fee) and barberNetActual is what the subaccount ACTUALLY banked —
+// normally the same figure, because transaction_charge is fixed at initialize
+// time and cannot be revised. barberDrift is the fee estimate error, which
+// with bearer "account" is absorbed entirely by the owner: ownerNet =
+// ownerCut + barberDrift is what the owner actually kept. Older rows have
+// these as null.
 export interface LedgerRow {
     id: string;               // doc id == payment reference
     reference: string;
@@ -203,12 +206,13 @@ export interface LedgerRow {
     timeSlot: string | null;
     charged: number | null;   // gross amount the client paid (rand)
     base: number | null;      // service base price (charged - R50)
-    ownerCut: number | null;  // exactly 10% of base
+    ownerCut: number | null;  // exactly 10% of base (the entitlement)
+    ownerNet: number | null;  // what the owner actually kept (cut + drift)
     paystackFeeActual: number | null;
     estimatedFee: number | null;
     barberNet: number | null;        // routed by Paystack (estimate-based)
-    barberNetActual: number | null;  // owed to the barber (actual fee)
-    barberDrift: number | null;      // actual - routed; owner settles this
+    barberNetActual: number | null;  // actually banked by the subaccount
+    barberDrift: number | null;      // estimatedFee - actualFee; owner absorbs
     refundedAmount: number | null;
     bookingId: string | null;
     createdAt: Date | null;   // transaction time (webhook processing time)
@@ -310,6 +314,7 @@ export const api = {
               charged: num(r.charged),
               base: num(r.base),
               ownerCut: num(r.ownerCut),
+              ownerNet: num(r.ownerNet),
               paystackFeeActual: num(r.paystackFeeActual),
               estimatedFee: num(r.estimatedFee),
               barberNet: num(r.barberNet),
