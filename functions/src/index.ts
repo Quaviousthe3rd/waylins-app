@@ -53,6 +53,7 @@ const KNOWN_PAYMENT_CONFIG_FIELDS = new Set([
   "subaccountCode",
   "feePercent",
   "feeFlatRand",
+  "feeVatPercent",
   // Legacy fields from the grossed-up model; ignored by the flat-R50 model
   // but still tolerated on the existing doc so validation stays quiet.
   "roundToRand",

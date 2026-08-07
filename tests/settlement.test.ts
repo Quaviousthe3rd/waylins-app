@@ -85,9 +85,14 @@ describe('settlement idempotency', () => {
       expect(l.paystackFeeActual).toBe(7.96); // actual, not the R8.25 estimate
       expect(l.estimatedFee).toBe(8.25);
       expect(l.barberNet).toBe(221.75); // what the split routed
-      expect(l.barberNetActual).toBe(222.04); // 250 - 7.96 - 20
-      expect(l.barberDrift).toBe(0.29); // owner owes the barber 29c
-      expect(l.ownerNet).toBe(20); // owner still gets exactly 10% of base
+      // transaction_charge is fixed at init, so the subaccount banks exactly
+      // the routed figure regardless of the real fee.
+      expect(l.barberNetActual).toBe(221.75);
+      // Model says the barber was owed 250 - 7.96 - 20 = 222.04, so the
+      // estimate over-charged the barber's side by 29c.
+      expect(l.barberDrift).toBe(0.29);
+      // ...and that 29c sat with the OWNER, who therefore nets above its 10%.
+      expect(l.ownerNet).toBe(20.29);
       // Exact decomposition of the charge.
       expect(
         Math.round((l.barberNetActual + l.ownerNet + l.paystackFeeActual) * 100)

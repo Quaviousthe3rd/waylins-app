@@ -289,7 +289,8 @@ export const settleCharge = async (
     estimatedFee: amounts.estimatedFeeRand ?? null,
     // What Paystack routed to the subaccount (estimate-based).
     barberNet: amounts.barberNetRand ?? null,
-    // What the barber is owed once the real fee is known, and the difference.
+    // What Paystack actually banked to the subaccount, and how far the fee
+    // estimate missed (the miss is absorbed by ownerNet, not by the barber).
     barberNetActual: split ? randFromCents(split.barberNetActualCents) : null,
     barberDrift: split ? randFromCents(split.barberDriftCents) : null,
     ownerNet: split ? randFromCents(split.ownerNetCents) : null,
