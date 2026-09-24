@@ -33,7 +33,7 @@ export const HomePage: React.FC = () => {
             <div className="flex flex-col items-center">
               <MapPin className="w-8 h-8 text-[#007AFF] mb-3" />
               <p className="text-[#8E8E93] text-sm mb-1">Location</p>
-              <p className="font-semibold text-[#1C1C1E]">206 Mathews Meyiwa Road, Durban</p>
+              <p className="font-semibold text-[#1C1C1E]">196 Gordon Rd, Morningside</p>
             </div>
             <div className="flex flex-col items-center">
               <Phone className="w-8 h-8 text-[#007AFF] mb-3" />
